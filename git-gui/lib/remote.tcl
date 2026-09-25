@@ -32,7 +32,7 @@ proc all_tracking_branches {} {
 	}
 
 	if {$pat ne {}} {
-		set fd [eval git_read for-each-ref --format=%(refname) $cmd]
+		set fd [git_read [concat for-each-ref --format=%(refname) $cmd]]
 		while {[gets $fd n] > 0} {
 			foreach spec $pat {
 				set dst [string range [lindex $spec 0] 0 end-2]
@@ -75,7 +75,7 @@ proc load_all_remotes {} {
 
 		foreach name $all_remotes {
 			catch {
-				set fd [open [file join $rm_dir $name] r]
+				set fd [safe_open_file [file join $rm_dir $name] r]
 				while {[gets $fd line] >= 0} {
 					if {[regexp {^URL:[ 	]*(.+)$} $line line url]} {
 						set remote_url($name) $url
@@ -145,7 +145,7 @@ proc add_fetch_entry {r} {
 		}
 	} else {
 		catch {
-			set fd [open [gitdir remotes $r] r]
+			set fd [safe_open_file [gitdir remotes $r] r]
 			while {[gets $fd n] >= 0} {
 				if {[regexp {^Pull:[ \t]*([^:]+):} $n]} {
 					set enable 1
@@ -182,7 +182,7 @@ proc add_push_entry {r} {
 		}
 	} else {
 		catch {
-			set fd [open [gitdir remotes $r] r]
+			set fd [safe_open_file [gitdir remotes $r] r]
 			while {[gets $fd n] >= 0} {
 				if {[regexp {^Push:[ \t]*([^:]+):} $n]} {
 					set enable 1
@@ -233,8 +233,6 @@ proc make_sure_remote_submenues_exist {remote_m} {
 proc update_all_remotes_menu_entry {} {
 	global all_remotes
 
-	if {[git-version < 1.6.6]} { return }
-
 	set have_remote 0
 	foreach r $all_remotes {
 		incr have_remote
@@ -246,22 +244,22 @@ proc update_all_remotes_menu_entry {} {
 	if {$have_remote > 1} {
 		make_sure_remote_submenues_exist $remote_m
 		if {[$fetch_m type end] eq "command" \
-			&& [$fetch_m entrycget end -label] ne "All"} {
+				&& [$fetch_m entrycget end -label] ne [mc "All"]} {
 
 			$fetch_m insert end separator
 			$fetch_m insert end command \
-				-label "All" \
+				-label [mc "All"] \
 				-command fetch_from_all
 
 			$prune_m insert end separator
 			$prune_m insert end command \
-				-label "All" \
+				-label [mc "All"] \
 				-command prune_from_all
 		}
 	} else {
 		if {[winfo exists $fetch_m]} {
 			if {[$fetch_m type end] eq "command" \
-				&& [$fetch_m entrycget end -label] eq "All"} {
+					&& [$fetch_m entrycget end -label] eq [mc "All"]} {
 
 				delete_from_menu $fetch_m end
 				delete_from_menu $fetch_m end

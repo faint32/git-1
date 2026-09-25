@@ -1,14 +1,15 @@
 #!/usr/bin/perl
 # Copyright (C) 2006, Eric Wong <normalperson@yhbt.net>
 # License: GPL v2 or later
-use 5.008;
-use warnings;
+require v5.26;
+use warnings $ENV{GIT_PERL_FATAL_WARNINGS} ? qw(FATAL all) : ();
 use strict;
 use vars qw/	$AUTHOR $VERSION
-		$sha1 $sha1_short $_revision $_repository
+		$oid $oid_short $oid_length
+		$_revision $_repository
 		$_q $_authors $_authors_prog %users/;
 $AUTHOR = 'Eric Wong <normalperson@yhbt.net>';
-$VERSION = '@@GIT_VERSION@@';
+$VERSION = '@GIT_VERSION@';
 
 use Carp qw/croak/;
 use File::Basename qw/dirname basename/;
@@ -44,6 +45,7 @@ use Git qw(
 	command_close_pipe
 	command_bidi_pipe
 	command_close_bidi_pipe
+	get_record
 );
 
 BEGIN {
@@ -102,14 +104,15 @@ sub _req_svn {
 	}
 }
 
-$sha1 = qr/[a-f\d]{40}/;
-$sha1_short = qr/[a-f\d]{4,40}/;
+$oid = qr/(?:[a-f\d]{40}(?:[a-f\d]{24})?)/;
+$oid_short = qr/[a-f\d]{4,64}/;
+$oid_length = 40;
 my ($_stdin, $_help, $_edit,
 	$_message, $_file, $_branch_dest,
 	$_template, $_shared,
 	$_version, $_fetch_all, $_no_rebase, $_fetch_parent,
 	$_before, $_after,
-	$_merge, $_strategy, $_preserve_merges, $_dry_run, $_parents, $_local,
+	$_merge, $_strategy, $_rebase_merges, $_dry_run, $_parents, $_local,
 	$_prefix, $_no_checkout, $_url, $_verbose,
 	$_commit_url, $_tag, $_merge_info, $_interactive, $_set_svn_props);
 
@@ -216,11 +219,11 @@ my %cmd = (
 	                "Set an SVN repository to a git tree-ish",
 			{ 'stdin' => \$_stdin, %cmt_opts, %fc_opts, } ],
 	'create-ignore' => [ \&cmd_create_ignore,
-			     'Create a .gitignore per svn:ignore',
+			     "Create a .gitignore per directory with SVN ignore properties",
 			     { 'revision|r=i' => \$_revision
 			     } ],
 	'mkdirs' => [ \&cmd_mkdirs ,
-	              "recreate empty directories after a checkout",
+	              "Recreate empty directories after a checkout",
 	              { 'revision|r=i' => \$_revision } ],
         'propget' => [ \&cmd_propget,
 		       'Print the value of a property on a file or directory',
@@ -231,7 +234,7 @@ my %cmd = (
         'proplist' => [ \&cmd_proplist,
 		       'List all properties of a file or directory',
 		       { 'revision|r=i' => \$_revision } ],
-	'show-ignore' => [ \&cmd_show_ignore, "Show svn:ignore listings",
+	'show-ignore' => [ \&cmd_show_ignore, "Show .gitignore patterns from SVN ignore properties",
 			{ 'revision|r=i' => \$_revision
 			} ],
 	'show-externals' => [ \&cmd_show_externals, "Show svn:externals listings",
@@ -269,7 +272,7 @@ my %cmd = (
 			  'local|l' => \$_local,
 			  'fetch-all|all' => \$_fetch_all,
 			  'dry-run|n' => \$_dry_run,
-			  'preserve-merges|p' => \$_preserve_merges,
+			  'rebase-merges|p' => \$_rebase_merges,
 			  %fc_opts } ],
 	'commit-diff' => [ \&cmd_commit_diff,
 	                   'Commit a diff between two trees',
@@ -294,28 +297,12 @@ my %cmd = (
 		{} ],
 );
 
-package FakeTerm;
-sub new {
-	my ($class, $reason) = @_;
-	return bless \$reason, shift;
-}
-sub readline {
-	my $self = shift;
-	die "Cannot use readline on FakeTerm: $$self";
-}
-package main;
-
 my $term;
 sub term_init {
-	$term = eval {
-		require Term::ReadLine;
-		$ENV{"GIT_SVN_NOTTY"}
+	require Term::ReadLine;
+	$term = $ENV{"GIT_SVN_NOTTY"}
 			? new Term::ReadLine 'git-svn', \*STDIN, \*STDOUT
 			: new Term::ReadLine 'git-svn';
-	};
-	if ($@) {
-		$term = new FakeTerm "$@: going non-interactive";
-	}
 }
 
 my $cmd;
@@ -339,7 +326,7 @@ if ($cmd && $cmd =~ /(?:clone|init|multi-init)$/) {
 			die "failed to open $ENV{GIT_DIR}: $!\n";
 		$ENV{GIT_DIR} = $1 if <$fh> =~ /^gitdir: (.+)$/;
 	}
-} else {
+} elsif ($cmd) {
 	my ($git_dir, $cdup);
 	git_cmd_try {
 		$git_dir = command_oneline([qw/rev-parse --git-dir/]);
@@ -356,7 +343,7 @@ if ($cmd && $cmd =~ /(?:clone|init|multi-init)$/) {
 
 my %opts = %{$cmd{$cmd}->[2]} if (defined $cmd);
 
-read_git_config(\%opts);
+read_git_config(\%opts) if $ENV{GIT_DIR};
 if ($cmd && ($cmd eq 'log' || $cmd eq 'blame')) {
 	Getopt::Long::Configure('pass_through');
 }
@@ -373,7 +360,8 @@ version() if $_version;
 usage(1) unless defined $cmd;
 load_authors() if $_authors;
 if (defined $_authors_prog) {
-	$_authors_prog = "'" . File::Spec->rel2abs($_authors_prog) . "'";
+	my $abs_file = File::Spec->rel2abs($_authors_prog);
+	$_authors_prog = "'" . $abs_file . "'" if -x $abs_file;
 }
 
 unless ($cmd =~ /^(?:clone|init|multi-init|commit-diff)$/) {
@@ -495,6 +483,7 @@ sub do_git_init_db {
 		command_noisy('config', "$pfx.preserve-empty-dirs", 'true');
 		command_noisy('config', "$pfx.placeholder-filename", $$fname);
 	}
+	load_object_format();
 }
 
 sub init_subdir {
@@ -507,7 +496,10 @@ sub init_subdir {
 
 sub cmd_clone {
 	my ($url, $path) = @_;
-	if (!defined $path &&
+	if (!$url) {
+		die "SVN repository location required ",
+		    "as a command-line argument\n";
+	} elsif (!defined $path &&
 	    (defined $_trunk || @_branches || @_tags ||
 	     defined $_stdlayout) &&
 	    $url !~ m#^[a-z\+]+://#) {
@@ -576,7 +568,7 @@ sub cmd_set_tree {
 		print "Reading from stdin...\n";
 		@commits = ();
 		while (<STDIN>) {
-			if (/\b($sha1_short)\b/o) {
+			if (/\b($oid_short)\b/o) {
 				unshift @commits, $1;
 			}
 		}
@@ -927,6 +919,7 @@ sub cmd_dcommit {
 		# information from different SVN repos, and paths
 		# which are not underneath this repository root.
 		my $rooturl = $gs->repos_root;
+	        Git::SVN::remove_username($rooturl);
 		foreach my $d (@$linear_refs) {
 			my %parentshash;
 			read_commit_parents(\%parentshash, $d);
@@ -1048,7 +1041,7 @@ sub cmd_dcommit {
 					  'If you are attempting to commit ',
 					  "merges, try running:\n\t",
 					  'git rebase --interactive',
-					  '--preserve-merges ',
+					  '--rebase-merges ',
 					  $gs->refname,
 					  "\nBefore dcommitting";
 				}
@@ -1171,10 +1164,10 @@ sub cmd_branch {
 	::_req_svn();
 	require SVN::Client;
 
+	my ($config, $baton, undef) = Git::SVN::Ra::prepare_config_once();
 	my $ctx = SVN::Client->new(
-		config => SVN::Core::config_get_config(
-			$Git::SVN::Ra::config_dir
-		),
+		auth => $baton,
+		config => $config,
 		log_msg => sub {
 			${ $_[0] } = defined $_message
 				? $_message
@@ -1194,6 +1187,11 @@ sub cmd_branch {
 	print "Copying ${src} at r${rev} to ${dst}...\n";
 	$ctx->copy($src, $rev, $dst)
 		unless $_dry_run;
+
+	# Release resources held by ctx before creating another SVN::Ra
+	# so destruction is orderly.  This seems necessary with SVN 1.9.5
+	# to avoid segfaults.
+	$ctx = undef;
 
 	$gs->fetch_all;
 }
@@ -1281,12 +1279,20 @@ sub cmd_show_ignore {
 	$gs->prop_walk($gs->path, $r, sub {
 		my ($gs, $path, $props) = @_;
 		print STDOUT "\n# $path\n";
-		my $s = $props->{'svn:ignore'} or return;
-		$s =~ s/[\r\n]+/\n/g;
-		$s =~ s/^\n+//;
-		chomp $s;
-		$s =~ s#^#$path#gm;
-		print STDOUT "$s\n";
+		if (my $s = $props->{'svn:ignore'}) {
+			$s =~ s/[\r\n]+/\n/g;
+			$s =~ s/^\n+//;
+			chomp $s;
+			$s =~ s#^#$path#gm;
+			print STDOUT "$s\n";
+		}
+		if (my $s = $props->{'svn:global-ignores'}) {
+			$s =~ s/[\r\n]+/\n/g;
+			$s =~ s/^\n+//;
+			chomp $s;
+			$s =~ s#^#$path**/#gm;
+			print STDOUT "$s\n";
+		}
 	});
 }
 
@@ -1317,16 +1323,25 @@ sub cmd_create_ignore {
 		# which git won't track
 		mkpath([$path]) unless -d $path;
 		my $ignore = $path . '.gitignore';
-		my $s = $props->{'svn:ignore'} or return;
 		open(GITIGNORE, '>', $ignore)
 		  or fatal("Failed to open `$ignore' for writing: $!");
-		$s =~ s/[\r\n]+/\n/g;
-		$s =~ s/^\n+//;
-		chomp $s;
-		# Prefix all patterns so that the ignore doesn't apply
-		# to sub-directories.
-		$s =~ s#^#/#gm;
-		print GITIGNORE "$s\n";
+		if (my $s = $props->{'svn:ignore'}) {
+			$s =~ s/[\r\n]+/\n/g;
+			$s =~ s/^\n+//;
+			chomp $s;
+			# Prefix all patterns so that the ignore doesn't apply
+			# to sub-directories.
+			$s =~ s#^#/#gm;
+			print GITIGNORE "$s\n";
+		}
+		if (my $s = $props->{'svn:global-ignores'}) {
+			$s =~ s/[\r\n]+/\n/g;
+			$s =~ s/^\n+//;
+			chomp $s;
+			# Global ignores apply to sub-directories, so they are
+			# not prefixed.
+			print GITIGNORE "$s\n";
+		}
 		close(GITIGNORE)
 		  or fatal("Failed to close `$ignore': $!");
 		command_noisy('add', '-f', $ignore);
@@ -1696,7 +1711,7 @@ sub cmd_gc {
 		     "files will not be compressed.\n";
 	}
 	File::Find::find({ wanted => \&gc_directory, no_chdir => 1},
-			 "$ENV{GIT_DIR}/svn");
+			 Git::SVN::svn_dir());
 }
 
 ########################### utility functions #########################
@@ -1706,7 +1721,7 @@ sub rebase_cmd {
 	push @cmd, '-v' if $_verbose;
 	push @cmd, qw/--merge/ if $_merge;
 	push @cmd, "--strategy=$_strategy" if $_strategy;
-	push @cmd, "--preserve-merges" if $_preserve_merges;
+	push @cmd, "--rebase-merges" if $_rebase_merges;
 	@cmd;
 }
 
@@ -1730,7 +1745,7 @@ sub post_fetch_checkout {
 	return unless verify_ref('HEAD^0');
 
 	return if $ENV{GIT_DIR} !~ m#^(?:.*/)?\.git$#;
-	my $index = $ENV{GIT_INDEX_FILE} || "$ENV{GIT_DIR}/index";
+	my $index = command_oneline(qw(rev-parse --git-path index));
 	return if -f $index;
 
 	return if command_oneline(qw/rev-parse --is-inside-work-tree/) eq 'false';
@@ -1745,11 +1760,12 @@ sub post_fetch_checkout {
 
 sub complete_svn_url {
 	my ($url, $path) = @_;
-	$path = canonicalize_path($path);
 
-	# If the path is not a URL...
-	if ($path !~ m#^[a-z\+]+://#) {
-		if (!defined $url || $url !~ m#^[a-z\+]+://#) {
+	if ($path =~ m#^[a-z\+]+://#i) { # path is a URL
+		$path = canonicalize_url($path);
+	} else {
+		$path = canonicalize_path($path);
+		if (!defined $url || $url !~ m#^[a-z\+]+://#i) {
 			fatal("E: '$path' is not a complete URL ",
 			      "and a separate URL is not specified");
 		}
@@ -1764,11 +1780,12 @@ sub complete_url_ls_init {
 		print STDERR "W: $switch not specified\n";
 		return;
 	}
-	$repo_path = canonicalize_path($repo_path);
-	if ($repo_path =~ m#^[a-z\+]+://#) {
+	if ($repo_path =~ m#^[a-z\+]+://#i) {
+		$repo_path = canonicalize_url($repo_path);
 		$ra = Git::SVN::Ra->new($repo_path);
 		$repo_path = '';
 	} else {
+		$repo_path = canonicalize_path($repo_path);
 		$repo_path =~ s#^/+##;
 		unless ($ra) {
 			fatal("E: '$repo_path' is not a complete URL ",
@@ -1817,7 +1834,7 @@ sub get_tree_from_treeish {
 	if ($type eq 'commit') {
 		$expected = (grep /^tree /, command(qw/cat-file commit/,
 		                                    $treeish))[0];
-		($expected) = ($expected =~ /^tree ($sha1)$/o);
+		($expected) = ($expected =~ /^tree ($oid)$/o);
 		die "Unable to get tree from $treeish\n" unless $expected;
 	} elsif ($type eq 'tree') {
 		$expected = $treeish;
@@ -1830,8 +1847,9 @@ sub get_tree_from_treeish {
 sub get_commit_entry {
 	my ($treeish) = shift;
 	my %log_entry = ( log => '', tree => get_tree_from_treeish($treeish) );
-	my $commit_editmsg = "$ENV{GIT_DIR}/COMMIT_EDITMSG";
-	my $commit_msg = "$ENV{GIT_DIR}/COMMIT_MSG";
+	my @git_path = qw(rev-parse --git-path);
+	my $commit_editmsg = command_oneline(@git_path, 'COMMIT_EDITMSG');
+	my $commit_msg = command_oneline(@git_path, 'COMMIT_MSG');
 	open my $log_fh, '>', $commit_editmsg or croak $!;
 
 	my $type = command_oneline(qw/cat-file -t/, $treeish);
@@ -1858,6 +1876,7 @@ sub get_commit_entry {
 			}
 		}
 		$msgbuf =~ s/\s+$//s;
+		$msgbuf =~ s/\r\n/\n/sg; # SVN 1.6+ disallows CRLF
 		if ($Git::SVN::_add_author_from && defined($author)
 		    && !$saw_from) {
 			$msgbuf .= "\n\nFrom: $author";
@@ -1875,10 +1894,9 @@ sub get_commit_entry {
 	{
 		require Encode;
 		# SVN requires messages to be UTF-8 when entering the repo
-		local $/;
 		open $log_fh, '<', $commit_msg or croak $!;
 		binmode $log_fh;
-		chomp($log_entry{log} = <$log_fh>);
+		chomp($log_entry{log} = get_record($log_fh, undef));
 
 		my $enc = Git::config('i18n.commitencoding') || 'UTF-8';
 		my $msg = $log_entry{log};
@@ -1960,7 +1978,13 @@ sub read_git_config {
 			}
 		}
 	}
+	load_object_format();
 	delete @$opts{@config_only} if @config_only;
+}
+
+sub load_object_format {
+	chomp(my $hash = `git config --get extensions.objectformat`);
+	$::oid_length = 64 if $hash eq 'sha256';
 }
 
 sub extract_metadata {
@@ -1991,10 +2015,10 @@ sub cmt_sha2rev_batch {
 		print $out $sha, "\n";
 
 		while (my $line = <$in>) {
-			if ($first && $line =~ /^[[:xdigit:]]{40}\smissing$/) {
+			if ($first && $line =~ /^$::oid\smissing$/) {
 				last;
 			} elsif ($first &&
-			       $line =~ /^[[:xdigit:]]{40}\scommit\s(\d+)$/) {
+			       $line =~ /^$::oid\scommit\s(\d+)$/) {
 				$first = 0;
 				$size = $1;
 				next;
@@ -2021,7 +2045,7 @@ sub working_head_info {
 	my $hash;
 	my %max;
 	while (<$fh>) {
-		if ( m{^commit ($::sha1)$} ) {
+		if ( m{^commit ($::oid)$} ) {
 			unshift @$refs, $hash if $hash and $refs;
 			$hash = $1;
 			next;

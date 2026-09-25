@@ -12,6 +12,7 @@ GN='純'
 HT='	'
 DQ='"'
 
+test_have_prereq MINGW ||
 echo foo 2>/dev/null > "Name and an${HT}HT"
 if ! test -f "Name and an${HT}HT"
 then
@@ -59,16 +60,18 @@ With SP in it
 "\346\277\261\351\207\216\347\264\224"
 EOF
 
-cat >expect.raw <<\EOF
+# NOTE: do not quote this heredoc, Dash 0.5.13 has a bug with heredocs
+# that contain multibyte chars.
+cat >expect.raw <<EOF
 Name
-"Name and a\nLF"
-"Name and an\tHT"
-"Name\""
+"Name and a\\nLF"
+"Name and an\\tHT"
+"Name\\""
 With SP in it
-"濱野\t純"
-"濱野\n純"
+"濱野\\t純"
+"濱野\\n純"
 濱野 純
-"濱野\"純"
+"濱野\\"純"
 濱野/file
 濱野純
 EOF

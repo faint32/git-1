@@ -1,11 +1,17 @@
-#include "cache.h"
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
+#include "gettext.h"
+#include "hex-ll.h"
+#include "strbuf.h"
 #include "urlmatch.h"
+#include "url.h"
 
 #define URL_ALPHA "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 #define URL_DIGIT "0123456789"
 #define URL_ALPHADIGIT URL_ALPHA URL_DIGIT
 #define URL_SCHEME_CHARS URL_ALPHADIGIT "+.-"
-#define URL_HOST_CHARS URL_ALPHADIGIT ".-[:]" /* IPv6 literals need [:] */
+#define URL_HOST_CHARS URL_ALPHADIGIT ".-_[:]" /* IPv6 literals need [:] */
 #define URL_UNSAFE_CHARS " <>\"%{}|\\^`" /* plus 0x00-0x1F,0x7F-0xFF */
 #define URL_GEN_RESERVED ":/?#[]@"
 #define URL_SUB_RESERVED "!$&'()*+,;="
@@ -42,12 +48,12 @@ static int append_normalized_escapes(struct strbuf *buf,
 
 		from_len--;
 		if (ch == '%') {
-			if (from_len < 2 ||
-			    !isxdigit(from[0]) ||
-			    !isxdigit(from[1]))
+			if (from_len < 2)
 				return 0;
-			ch = hexval(*from++) << 4;
-			ch |= hexval(*from++);
+			ch = hex2chr(from);
+			if (ch < 0)
+				return 0;
+			from += 2;
 			from_len -= 2;
 			was_esc = 1;
 		}
@@ -63,7 +69,50 @@ static int append_normalized_escapes(struct strbuf *buf,
 	return 1;
 }
 
-char *url_normalize(const char *url, struct url_info *out_info)
+static const char *end_of_token(const char *s, int c, size_t n)
+{
+	const char *next = memchr(s, c, n);
+	if (!next)
+		next = s + n;
+	return next;
+}
+
+static int match_host(const struct url_info *url_info,
+		      const struct url_info *pattern_info)
+{
+	const char *url = url_info->url + url_info->host_off;
+	const char *pat = pattern_info->url + pattern_info->host_off;
+	int url_len = url_info->host_len;
+	int pat_len = pattern_info->host_len;
+
+	while (url_len && pat_len) {
+		const char *url_next = end_of_token(url, '.', url_len);
+		const char *pat_next = end_of_token(pat, '.', pat_len);
+
+		if (pat_next == pat + 1 && pat[0] == '*')
+			/* wildcard matches anything */
+			;
+		else if ((pat_next - pat) == (url_next - url) &&
+			 !memcmp(url, pat, url_next - url))
+			/* the components are the same */
+			;
+		else
+			return 0; /* found an unmatch */
+
+		if (url_next < url + url_len)
+			url_next++;
+		url_len -= url_next - url;
+		url = url_next;
+		if (pat_next < pat + pat_len)
+			pat_next++;
+		pat_len -= pat_next - pat;
+		pat = pat_next;
+	}
+
+	return (!url_len && !pat_len);
+}
+
+static char *url_normalize_1(const char *url, struct url_info *out_info, bool allow_globs)
 {
 	/*
 	 * Normalize NUL-terminated url using the following rules:
@@ -104,7 +153,7 @@ char *url_normalize(const char *url, struct url_info *out_info)
 	struct strbuf norm;
 	size_t spanned;
 	size_t scheme_len, user_off=0, user_len=0, passwd_off=0, passwd_len=0;
-	size_t host_off=0, host_len=0, port_len=0, path_off, path_len, result_len;
+	size_t host_off=0, host_len=0, port_off=0, port_len=0, path_off, path_len, result_len;
 	const char *slash_ptr, *at_ptr, *colon_ptr, *path_start;
 	char *result;
 
@@ -166,7 +215,7 @@ char *url_normalize(const char *url, struct url_info *out_info)
 	 */
 	if (!url_len || strchr(":/?#", *url)) {
 		/* Missing host invalid for all URL schemes except file */
-		if (strncmp(norm.buf, "file:", 5)) {
+		if (!starts_with(norm.buf, "file:")) {
 			if (out_info) {
 				out_info->url = NULL;
 				out_info->err = _("missing host and scheme is not 'file:'");
@@ -191,7 +240,12 @@ char *url_normalize(const char *url, struct url_info *out_info)
 		strbuf_release(&norm);
 		return NULL;
 	}
-	spanned = strspn(url, URL_HOST_CHARS);
+
+	if (allow_globs)
+		spanned = strspn(url, URL_HOST_CHARS "*");
+	else
+		spanned = strspn(url, URL_HOST_CHARS);
+
 	if (spanned < colon_ptr - url) {
 		/* Host name has invalid characters */
 		if (out_info) {
@@ -220,11 +274,11 @@ char *url_normalize(const char *url, struct url_info *out_info)
 		if (url == slash_ptr) {
 			/* Skip ":" port with no number, it's same as default */
 		} else if (slash_ptr - url == 2 &&
-			   !strncmp(norm.buf, "http:", 5) &&
+			   starts_with(norm.buf, "http:") &&
 			   !strncmp(url, "80", 2)) {
 			/* Skip http :80 as it's the default */
 		} else if (slash_ptr - url == 3 &&
-			   !strncmp(norm.buf, "https:", 6) &&
+			   starts_with(norm.buf, "https:") &&
 			   !strncmp(url, "443", 3)) {
 			/* Skip https :443 as it's the default */
 		} else {
@@ -258,6 +312,7 @@ char *url_normalize(const char *url, struct url_info *out_info)
 				return NULL;
 			}
 			strbuf_addch(&norm, ':');
+			port_off = norm.len;
 			strbuf_add(&norm, url, slash_ptr - url);
 			port_len = slash_ptr - url;
 		}
@@ -265,7 +320,7 @@ char *url_normalize(const char *url, struct url_info *out_info)
 		url = slash_ptr;
 	}
 	if (host_off)
-		host_len = norm.len - host_off;
+		host_len = norm.len - host_off - (port_len ? port_len + 1 : 0);
 
 
 	/*
@@ -373,11 +428,148 @@ char *url_normalize(const char *url, struct url_info *out_info)
 		out_info->passwd_len = passwd_len;
 		out_info->host_off = host_off;
 		out_info->host_len = host_len;
+		out_info->port_off = port_off;
 		out_info->port_len = port_len;
 		out_info->path_off = path_off;
 		out_info->path_len = path_len;
 	}
 	return result;
+}
+
+char *url_normalize(const char *url, struct url_info *out_info)
+{
+	return url_normalize_1(url, out_info, false);
+}
+
+char *url_normalize_pattern(const char *url, struct url_info *out_info)
+{
+	return url_normalize_1(url, out_info, true);
+}
+
+char *url_parse(const char *url_orig, struct url_info *out_info)
+{
+	struct strbuf url;
+	char *host, *separator;
+	char *detached, *normalized;
+	char *url_decoded;
+	enum url_scheme scheme = URL_SCHEME_LOCAL;
+	struct url_info local_info;
+	struct url_info *info = out_info ? out_info : &local_info;
+	bool scp_syntax = false;
+
+	if (is_url(url_orig))
+		url_decoded = url_decode(url_orig);
+	else
+		url_decoded = xstrdup(url_orig);
+
+	strbuf_init(&url, strlen(url_decoded) + sizeof("ssh://"));
+	strbuf_addstr(&url, url_decoded);
+	free(url_decoded);
+
+	host = strstr(url.buf, "://");
+	if (host) {
+		/*
+		 * Temporarily NUL-terminate the scheme name
+		 * so we can pass it to url_get_scheme(),
+		 * then restore the ':' so the buffer
+		 * is intact for url_normalize() below.
+		 */
+		char saved = *host;
+		*host = '\0';
+		scheme = url_get_scheme(url.buf);
+		*host = saved;
+		host += 3;
+	} else {
+		if (!url_is_local_not_ssh(url.buf)) {
+			scp_syntax = true;
+			scheme = URL_SCHEME_SSH;
+			strbuf_insertstr(&url, 0, "ssh://");
+			host = url.buf + strlen("ssh://");
+		}
+	}
+
+	/*
+	 * Path starts after ':' in scp style SSH URLs.
+	 *
+	 * The host portion can begin with an optional "user@",
+	 * and the host itself can be wrapped in '[' ']' brackets.
+	 * The bracket form is git's legacy way of supporting:
+	 *
+	 *   - IPv6 literals: [::1]:repo
+	 *   - host:port pairs in the short form: [myhost:123]:src
+	 *   - Plain hostnames that happen to need bracketing: [host]:path
+	 *
+	 * Treat '[' followed by 0 or 1 inner colons as the host:port
+	 * or plain hostname form and strip the brackets so url_normalize
+	 * sees host[:port] natively. Two or more inner colons mark an
+	 * IPv6 literal: keep the brackets for url_normalize to recognize.
+	 *
+	 * The scp path separator is the ':' that follows the host part,
+	 * and we must skip over user@ and any '[...]' before searching.
+	 */
+	if (scp_syntax) {
+		char *user_at;
+		char *host_start;
+		char *bracket_end;
+
+		user_at = strchr(host, '@');
+		host_start = user_at ? user_at + 1 : host;
+
+		if (*host_start == '[') {
+			char *p;
+			int inner_colons;
+
+			bracket_end = strchr(host_start, ']');
+			inner_colons = 0;
+			for (p = host_start + 1; bracket_end && p < bracket_end; p++)
+				if (*p == ':')
+					inner_colons++;
+
+			if (bracket_end && inner_colons <= 1) {
+				size_t close_off = bracket_end - url.buf;
+				size_t open_off = host_start - url.buf;
+				strbuf_remove(&url, close_off, 1);
+				strbuf_remove(&url, open_off, 1);
+				separator = url.buf + close_off - 1;
+			} else if (bracket_end) {
+				separator = strchr(bracket_end + 1, ':');
+			} else {
+				separator = strchr(host_start, ':');
+			}
+		} else {
+			separator = strchr(host_start, ':');
+		}
+
+		if (separator) {
+			if (separator[1] == '/')
+				strbuf_remove(&url, separator - url.buf, 1);
+			else
+				*separator = '/';
+		}
+	}
+
+	detached = strbuf_detach(&url, NULL);
+	normalized = url_normalize(detached, info);
+	free(detached);
+
+	if (!normalized)
+		return NULL;
+
+	/*
+	 * Point path to ~ for URLs like this:
+	 *
+	 *     ssh://host.xz/~user/repo
+	 *     git://host.xz/~user/repo
+	 *     host.xz:~user/repo
+	 */
+	if (scheme == URL_SCHEME_GIT || scheme == URL_SCHEME_SSH) {
+		if (normalized[info->path_off + 1] == '~') {
+			info->path_off++;
+			info->path_len--;
+		}
+	}
+
+	return normalized;
 }
 
 static size_t url_match_prefix(const char *url,
@@ -414,7 +606,7 @@ static size_t url_match_prefix(const char *url,
 
 static int match_urls(const struct url_info *url,
 		      const struct url_info *url_prefix,
-		      int *exactusermatch)
+		      struct urlmatch_item *match)
 {
 	/*
 	 * url_prefix matches url if the scheme, host and port of url_prefix
@@ -433,8 +625,8 @@ static int match_urls(const struct url_info *url,
 	 * contained a user name or false if url_prefix did not have a
 	 * user name.  If there is no match *exactusermatch is left untouched.
 	 */
-	int usermatched = 0;
-	int pathmatchlen;
+	char usermatched = 0;
+	size_t pathmatchlen;
 
 	if (!url || !url_prefix || !url->url || !url_prefix->url)
 		return 0;
@@ -454,38 +646,61 @@ static int match_urls(const struct url_info *url,
 		usermatched = 1;
 	}
 
-	/* check the host and port */
-	if (url_prefix->host_len != url->host_len ||
-	    strncmp(url->url + url->host_off,
-		    url_prefix->url + url_prefix->host_off, url->host_len))
-		return 0; /* host names and/or ports do not match */
+	/* check the host */
+	if (!match_host(url, url_prefix))
+		return 0; /* host names do not match */
+
+	/* check the port */
+	if (url_prefix->port_len != url->port_len ||
+	    strncmp(url->url + url->port_off,
+		    url_prefix->url + url_prefix->port_off, url->port_len))
+		return 0; /* ports do not match */
 
 	/* check the path */
 	pathmatchlen = url_match_prefix(
 		url->url + url->path_off,
 		url_prefix->url + url_prefix->path_off,
 		url_prefix->url_len - url_prefix->path_off);
+	if (!pathmatchlen)
+		return 0; /* paths do not match */
 
-	if (pathmatchlen && exactusermatch)
-		*exactusermatch = usermatched;
-	return pathmatchlen;
+	if (match) {
+		match->hostmatch_len = url_prefix->host_len;
+		match->pathmatch_len = pathmatchlen;
+		match->user_matched = usermatched;
+	}
+
+	return 1;
 }
 
-int urlmatch_config_entry(const char *var, const char *value, void *cb)
+static int cmp_matches(const struct urlmatch_item *a,
+		       const struct urlmatch_item *b)
+{
+	if (a->hostmatch_len != b->hostmatch_len)
+		return a->hostmatch_len < b->hostmatch_len ? -1 : 1;
+	if (a->pathmatch_len != b->pathmatch_len)
+		return a->pathmatch_len < b->pathmatch_len ? -1 : 1;
+	if (a->user_matched != b->user_matched)
+		return b->user_matched ? -1 : 1;
+	return 0;
+}
+
+int urlmatch_config_entry(const char *var, const char *value,
+			  const struct config_context *ctx, void *cb)
 {
 	struct string_list_item *item;
 	struct urlmatch_config *collect = cb;
-	struct urlmatch_item *matched;
+	struct urlmatch_item matched = {0};
 	struct url_info *url = &collect->url;
 	const char *key, *dot;
 	struct strbuf synthkey = STRBUF_INIT;
-	size_t matched_len = 0;
-	int user_matched = 0;
 	int retval;
+	int (*select_fn)(const struct urlmatch_item *a, const struct urlmatch_item *b) =
+		collect->select_fn ? collect->select_fn : cmp_matches;
 
 	if (!skip_prefix(var, collect->section, &key) || *(key++) != '.') {
 		if (collect->cascade_fn)
-			return collect->cascade_fn(var, value, cb);
+			return collect->cascade_fn(var, value, ctx, cb);
 		return 0; /* not interested */
 	}
 	dot = strrchr(key, '.');
@@ -494,13 +709,17 @@ int urlmatch_config_entry(const char *var, const char *value, void *cb)
 		struct url_info norm_info;
 
 		config_url = xmemdupz(key, dot - key);
-		norm_url = url_normalize(config_url, &norm_info);
+		norm_url = url_normalize_1(config_url, &norm_info, true);
+		if (norm_url)
+			retval = match_urls(url, &norm_info, &matched);
+		else if (collect->fallback_match_fn)
+			retval = collect->fallback_match_fn(config_url,
+							    collect->cb);
+		else
+			retval = 0;
 		free(config_url);
-		if (!norm_url)
-			return 0;
-		matched_len = match_urls(url, &norm_info, &user_matched);
 		free(norm_url);
-		if (!matched_len)
+		if (!retval)
 			return 0;
 		key = dot + 1;
 	}
@@ -510,29 +729,28 @@ int urlmatch_config_entry(const char *var, const char *value, void *cb)
 
 	item = string_list_insert(&collect->vars, key);
 	if (!item->util) {
-		matched = xcalloc(1, sizeof(*matched));
-		item->util = matched;
+		item->util = xcalloc(1, sizeof(matched));
 	} else {
-		matched = item->util;
-		/*
-		 * Is our match shorter?  Is our match the same
-		 * length, and without user while the current
-		 * candidate is with user?  Then we cannot use it.
-		 */
-		if (matched_len < matched->matched_len ||
-		    ((matched_len == matched->matched_len) &&
-		     (!user_matched && matched->user_matched)))
+		if (select_fn(&matched, item->util) < 0)
+			 /*
+			  * Our match is worse than the old one,
+			  * we cannot use it.
+			  */
 			return 0;
 		/* Otherwise, replace it with this one. */
 	}
 
-	matched->matched_len = matched_len;
-	matched->user_matched = user_matched;
+	memcpy(item->util, &matched, sizeof(matched));
 	strbuf_addstr(&synthkey, collect->section);
 	strbuf_addch(&synthkey, '.');
 	strbuf_addstr(&synthkey, key);
-	retval = collect->collect_fn(synthkey.buf, value, collect->cb);
+	retval = collect->collect_fn(synthkey.buf, value, ctx, collect->cb);
 
 	strbuf_release(&synthkey);
 	return retval;
+}
+
+void urlmatch_config_release(struct urlmatch_config *config)
+{
+	string_list_clear(&config->vars, 1);
 }

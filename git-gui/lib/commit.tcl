@@ -2,7 +2,7 @@
 # Copyright (C) 2006, 2007 Shawn Pearce
 
 proc load_last_commit {} {
-	global HEAD PARENT MERGE_HEAD commit_type ui_comm
+	global HEAD PARENT MERGE_HEAD commit_type ui_comm commit_author
 	global repo_config
 
 	if {[llength $PARENT] == 0} {
@@ -25,8 +25,10 @@ You are currently in the middle of a merge that has not been fully completed.  Y
 	set msg {}
 	set parents [list]
 	if {[catch {
-			set fd [git_read cat-file commit $curHEAD]
-			fconfigure $fd -encoding binary -translation lf
+			set name ""
+			set email ""
+			set fd [git_read [list cat-file commit $curHEAD]]
+			fconfigure $fd -encoding iso8859-1
 			# By default commits are assumed to be in utf-8
 			set enc utf-8
 			while {[gets $fd line] > 0} {
@@ -34,15 +36,21 @@ You are currently in the middle of a merge that has not been fully completed.  Y
 					lappend parents [string range $line 7 end]
 				} elseif {[string match {encoding *} $line]} {
 					set enc [string tolower [string range $line 9 end]]
-				}
+				} elseif {[regexp "author (.*)\\s<(.*)>\\s(\\d.*$)" $line all name email time]} { }
 			}
 			set msg [read $fd]
 			close $fd
 
 			set enc [tcl_encoding $enc]
 			if {$enc ne {}} {
-				set msg [encoding convertfrom $enc $msg]
+				set msg [convertfrom $enc $msg]
+				set name [convertfrom $enc $name]
+				set email [convertfrom $enc $email]
 			}
+			if {$name ne {} && $email ne {}} {
+				set commit_author [list name $name email $email date $time]
+			}
+
 			set msg [string trim $msg]
 		} err]} {
 		error_popup [strcat [mc "Error loading commit data for amend:"] "\n\n$err"]
@@ -106,9 +114,10 @@ proc do_signoff {} {
 }
 
 proc create_new_commit {} {
-	global commit_type ui_comm
+	global commit_type ui_comm commit_author
 
 	set commit_type normal
+	unset -nocomplain commit_author
 	$ui_comm delete 0.0 end
 	$ui_comm edit reset
 	$ui_comm edit modified false
@@ -198,25 +207,12 @@ You must stage at least 1 file before you can commit.
 
 	# -- A message is required.
 	#
-	set msg [string trim [$ui_comm get 1.0 end]]
-	regsub -all -line {[ \t\r]+$} $msg {} msg
-	if {$msg eq {}} {
-		error_popup [mc "Please supply a commit message.
-
-A good commit message has the following format:
-
-- First line: Describe in one sentence what you did.
-- Second line: Blank
-- Remaining lines: Describe why this change is good.
-"]
-		unlock_index
-		return
-	}
+	set msg [$ui_comm get 1.0 end]
 
 	# -- Build the message file.
 	#
 	set msg_p [gitdir GITGUI_EDITMSG]
-	set msg_wt [open $msg_p w]
+	set msg_wt [safe_open_file $msg_p w]
 	fconfigure $msg_wt -translation lf
 	setup_commit_encoding $msg_wt
 	puts $msg_wt $msg
@@ -234,7 +230,7 @@ A good commit message has the following format:
 
 	ui_status [mc "Calling pre-commit hook..."]
 	set pch_error {}
-	fconfigure $fd_ph -blocking 0 -translation binary -eofchar {}
+	fconfigure $fd_ph -blocking 0 -translation binary
 	fileevent $fd_ph readable \
 		[list commit_prehook_wait $fd_ph $curHEAD $msg_p]
 }
@@ -289,7 +285,7 @@ Do you really want to proceed with your Commit?"]
 
 	ui_status [mc "Calling commit-msg hook..."]
 	set pch_error {}
-	fconfigure $fd_ph -blocking 0 -translation binary -eofchar {}
+	fconfigure $fd_ph -blocking 0 -translation binary
 	fileevent $fd_ph readable \
 		[list commit_commitmsg_wait $fd_ph $curHEAD $msg_p]
 }
@@ -314,19 +310,66 @@ proc commit_commitmsg_wait {fd_ph curHEAD msg_p} {
 	fconfigure $fd_ph -blocking 0
 }
 
+proc wash_commit_message {msg} {
+	# Strip trailing whitespace
+	regsub -all -line {[ \t\r]+$} $msg {} msg
+	# Strip comment lines
+	global comment_string
+	set cmt_rx [strcat {(^|\n)} [regsub -all {\W} $comment_string {\\&}] {[^\n]*}]
+	regsub -all $cmt_rx $msg {\1} msg
+	# Strip leading and trailing empty lines (puts adds one \n)
+	set msg [string trim $msg \n]
+	# Compress consecutive empty lines
+	regsub -all {\n{3,}} $msg \n\n msg
+
+	return $msg
+}
+
 proc commit_writetree {curHEAD msg_p} {
+	# -- Process the commit message after hooks have run.
+	#
+	set msg_fd [safe_open_file $msg_p r]
+	setup_commit_encoding $msg_fd 1
+	set msg [read $msg_fd]
+	close $msg_fd
+
+	# Process the message (strip whitespace, comments, etc.)
+	set msg [wash_commit_message $msg]
+
+	if {$msg eq {}} {
+		error_popup [mc "Please supply a commit message.
+
+A good commit message has the following format:
+
+- First line: Describe in one sentence what you did.
+- Second line: Blank
+- Remaining lines: Describe why this change is good.
+"]
+		unlock_index
+		return
+	}
+
+	# Write the processed message back to the file
+	set msg_wt [safe_open_file $msg_p w]
+	fconfigure $msg_wt -translation lf
+	setup_commit_encoding $msg_wt
+	puts $msg_wt $msg
+	close $msg_wt
+
 	ui_status [mc "Committing changes..."]
-	set fd_wt [git_read write-tree]
+	set fd_wt [git_read [list write-tree]]
 	fileevent $fd_wt readable \
 		[list commit_committree $fd_wt $curHEAD $msg_p]
 }
 
 proc commit_committree {fd_wt curHEAD msg_p} {
-	global HEAD PARENT MERGE_HEAD commit_type
+	global HEAD PARENT MERGE_HEAD commit_type commit_author
 	global current_branch
-	global ui_comm selected_commit_type
+	global ui_comm commit_type_is_amend
 	global file_states selected_paths rescan_active
 	global repo_config
+	global env
+	global hashlength
 
 	gets $fd_wt tree_id
 	if {[catch {close $fd_wt} err]} {
@@ -340,13 +383,13 @@ proc commit_committree {fd_wt curHEAD msg_p} {
 	# -- Verify this wasn't an empty change.
 	#
 	if {$commit_type eq {normal}} {
-		set fd_ot [git_read cat-file commit $PARENT]
-		fconfigure $fd_ot -encoding binary -translation lf
+		set fd_ot [git_read [list cat-file commit $PARENT]]
+		fconfigure $fd_ot -encoding iso8859-1
 		set old_tree [gets $fd_ot]
 		close $fd_ot
 
 		if {[string equal -length 5 {tree } $old_tree]
-			&& [string length $old_tree] == 45} {
+			&& [string length $old_tree] == [expr {$hashlength + 5}]} {
 			set old_tree [string range $old_tree 5 end]
 		} else {
 			error [mc "Commit %s appears to be corrupt" $PARENT]
@@ -366,19 +409,31 @@ A rescan will be automatically started now.
 		}
 	}
 
+	if {[info exists commit_author]} {
+		set old_author [commit_author_ident $commit_author]
+	}
 	# -- Create the commit.
 	#
 	set cmd [list commit-tree $tree_id]
+	if {[is_config_true commit.gpgsign]} {
+		lappend cmd -S
+	}
 	foreach p [concat $PARENT $MERGE_HEAD] {
 		lappend cmd -p $p
 	}
-	lappend cmd <$msg_p
-	if {[catch {set cmt_id [eval git $cmd]} err]} {
+	set msgtxt [list <$msg_p]
+	if {[catch {set cmt_id [git_redir $cmd $msgtxt]} err]} {
 		catch {file delete $msg_p}
 		error_popup [strcat [mc "commit-tree failed:"] "\n\n$err"]
 		ui_status [mc "Commit failed."]
 		unlock_index
+		unset -nocomplain commit_author
+		commit_author_reset $old_author
 		return
+	}
+	if {[info exists commit_author]} {
+		unset -nocomplain commit_author
+		commit_author_reset $old_author
 	}
 
 	# -- Update the HEAD ref.
@@ -387,7 +442,7 @@ A rescan will be automatically started now.
 	if {$commit_type ne {normal}} {
 		append reflogm " ($commit_type)"
 	}
-	set msg_fd [open $msg_p r]
+	set msg_fd [safe_open_file $msg_p r]
 	setup_commit_encoding $msg_fd 1
 	gets $msg_fd subject
 	close $msg_fd
@@ -428,12 +483,13 @@ A rescan will be automatically started now.
 	if {$fd_ph ne {}} {
 		global pch_error
 		set pch_error {}
-		fconfigure $fd_ph -blocking 0 -translation binary -eofchar {}
+		fconfigure $fd_ph -blocking 0 -translation binary
 		fileevent $fd_ph readable \
 			[list commit_postcommit_wait $fd_ph $cmt_id]
 	}
 
 	$ui_comm delete 0.0 end
+	load_message [get_config commit.template]
 	$ui_comm edit reset
 	$ui_comm edit modified false
 	if {$::GITGUI_BCK_exists} {
@@ -445,8 +501,8 @@ A rescan will be automatically started now.
 
 	# -- Update in memory status
 	#
-	set selected_commit_type new
 	set commit_type normal
+	set commit_type_is_amend 0
 	set HEAD $cmt_id
 	set PARENT $cmt_id
 	set MERGE_HEAD [list]
@@ -505,4 +561,21 @@ proc commit_postcommit_wait {fd_ph cmt_id} {
 		return
 	}
 	fconfigure $fd_ph -blocking 0
+}
+
+proc commit_author_ident {details} {
+	global env
+	array set author $details
+	set old [array get env GIT_AUTHOR_*]
+	set env(GIT_AUTHOR_NAME) $author(name)
+	set env(GIT_AUTHOR_EMAIL) $author(email)
+	set env(GIT_AUTHOR_DATE) $author(date)
+	return $old
+}
+proc commit_author_reset {details} {
+	global env
+	unset env(GIT_AUTHOR_NAME) env(GIT_AUTHOR_EMAIL) env(GIT_AUTHOR_DATE)
+	if {$details ne {}} {
+		array set env $details
+	}
 }

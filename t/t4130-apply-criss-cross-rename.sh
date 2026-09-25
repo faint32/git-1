@@ -1,6 +1,7 @@
 #!/bin/sh
 
 test_description='git apply handling criss-cross rename patch.'
+
 . ./test-lib.sh
 
 create_file() {
@@ -13,9 +14,13 @@ create_file() {
 }
 
 test_expect_success 'setup' '
-	create_file file1 "File1 contents" &&
-	create_file file2 "File2 contents" &&
-	create_file file3 "File3 contents" &&
+	# Ensure that file sizes are different, because on Windows
+	# lstat() does not discover inode numbers, and we need
+	# other properties to discover swapped files
+	# (mtime is not always different, either).
+	create_file file1 "some content" &&
+	create_file file2 "some other content" &&
+	create_file file3 "again something else" &&
 	git add file1 file2 file3 &&
 	git commit -m 1
 '

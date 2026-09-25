@@ -1,14 +1,19 @@
+#define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
-#include "cache.h"
+#include "config.h"
 #include "dir.h"
+#include "environment.h"
+#include "gettext.h"
 #include "quote.h"
 #include "pathspec.h"
 #include "parse-options.h"
+#include "submodule.h"
+#include "write-or-die.h"
 
 static int quiet, verbose, stdin_paths, show_non_matching, no_index;
 static const char * const check_ignore_usage[] = {
 "git check-ignore [<options>] <pathname>...",
-"git check-ignore [<options>] --stdin < <list-of-paths>",
+"git check-ignore [<options>] --stdin",
 NULL
 };
 
@@ -29,19 +34,19 @@ static const struct option check_ignore_options[] = {
 	OPT_END()
 };
 
-static void output_exclude(const char *path, struct exclude *exclude)
+static void output_pattern(const char *path, struct path_pattern *pattern)
 {
-	char *bang  = (exclude && exclude->flags & EXC_FLAG_NEGATIVE)  ? "!" : "";
-	char *slash = (exclude && exclude->flags & EXC_FLAG_MUSTBEDIR) ? "/" : "";
+	const char *bang  = (pattern && pattern->flags & PATTERN_FLAG_NEGATIVE)  ? "!" : "";
+	const char *slash = (pattern && pattern->flags & PATTERN_FLAG_MUSTBEDIR) ? "/" : "";
 	if (!nul_term_line) {
 		if (!verbose) {
 			write_name_quoted(path, stdout, '\n');
 		} else {
-			if (exclude) {
-				quote_c_style(exclude->el->src, NULL, stdout, 0);
+			if (pattern) {
+				quote_c_style(pattern->pl->src, NULL, stdout, 0);
 				printf(":%d:%s%s%s\t",
-				       exclude->srcpos,
-				       bang, exclude->pattern, slash);
+				       pattern->srcpos,
+				       bang, pattern->pattern, slash);
 			}
 			else {
 				printf("::\t");
@@ -53,11 +58,11 @@ static void output_exclude(const char *path, struct exclude *exclude)
 		if (!verbose) {
 			printf("%s%c", path, '\0');
 		} else {
-			if (exclude)
+			if (pattern)
 				printf("%s%c%d%c%s%s%s%c%s%c",
-				       exclude->el->src, '\0',
-				       exclude->srcpos, '\0',
-				       bang, exclude->pattern, slash, '\0',
+				       pattern->pl->src, '\0',
+				       pattern->srcpos, '\0',
+				       bang, pattern->pattern, slash, '\0',
 				       path, '\0');
 			else
 				printf("%c%c%c%s%c", '\0', '\0', '\0', path, '\0');
@@ -70,8 +75,8 @@ static int check_ignore(struct dir_struct *dir,
 {
 	const char *full_path;
 	char *seen;
-	int num_ignored = 0, dtype = DT_UNKNOWN, i;
-	struct exclude *exclude;
+	int num_ignored = 0, i;
+	struct path_pattern *pattern;
 	struct pathspec pathspec;
 
 	if (!argc) {
@@ -87,47 +92,55 @@ static int check_ignore(struct dir_struct *dir,
 	parse_pathspec(&pathspec,
 		       PATHSPEC_ALL_MAGIC & ~PATHSPEC_FROMTOP,
 		       PATHSPEC_SYMLINK_LEADING_PATH |
-		       PATHSPEC_STRIP_SUBMODULE_SLASH_EXPENSIVE |
 		       PATHSPEC_KEEP_ORDER,
 		       prefix, argv);
+
+	die_path_inside_submodule(the_repository->index, &pathspec);
 
 	/*
 	 * look for pathspecs matching entries in the index, since these
 	 * should not be ignored, in order to be consistent with
 	 * 'git status', 'git add' etc.
 	 */
-	seen = find_pathspecs_matching_against_index(&pathspec);
+	seen = find_pathspecs_matching_against_index(&pathspec, the_repository->index,
+						     PS_HEED_SKIP_WORKTREE);
 	for (i = 0; i < pathspec.nr; i++) {
 		full_path = pathspec.items[i].match;
-		exclude = NULL;
+		pattern = NULL;
 		if (!seen[i]) {
-			exclude = last_exclude_matching(dir, full_path, &dtype);
+			int dtype = DT_UNKNOWN;
+			pattern = last_matching_pattern(dir, the_repository->index,
+							full_path, &dtype);
+			if (!verbose && pattern &&
+			    pattern->flags & PATTERN_FLAG_NEGATIVE)
+				pattern = NULL;
 		}
-		if (!quiet && (exclude || show_non_matching))
-			output_exclude(pathspec.items[i].original, exclude);
-		if (exclude)
+		if (!quiet && (pattern || show_non_matching))
+			output_pattern(pathspec.items[i].original, pattern);
+		if (pattern)
 			num_ignored++;
 	}
 	free(seen);
+	clear_pathspec(&pathspec);
 
 	return num_ignored;
 }
 
 static int check_ignore_stdin_paths(struct dir_struct *dir, const char *prefix)
 {
-	struct strbuf buf, nbuf;
+	struct strbuf buf = STRBUF_INIT;
+	struct strbuf unquoted = STRBUF_INIT;
 	char *pathspec[2] = { NULL, NULL };
-	int line_termination = nul_term_line ? 0 : '\n';
+	strbuf_getline_fn getline_fn;
 	int num_ignored = 0;
 
-	strbuf_init(&buf, 0);
-	strbuf_init(&nbuf, 0);
-	while (strbuf_getline(&buf, stdin, line_termination) != EOF) {
-		if (line_termination && buf.buf[0] == '"') {
-			strbuf_reset(&nbuf);
-			if (unquote_c_style(&nbuf, buf.buf, NULL))
+	getline_fn = nul_term_line ? strbuf_getline_nul : strbuf_getline_lf;
+	while (getline_fn(&buf, stdin) != EOF) {
+		if (!nul_term_line && buf.buf[0] == '"') {
+			strbuf_reset(&unquoted);
+			if (unquote_c_style(&unquoted, buf.buf, NULL))
 				die("line is badly quoted");
-			strbuf_swap(&buf, &nbuf);
+			strbuf_swap(&buf, &unquoted);
 		}
 		pathspec[0] = buf.buf;
 		num_ignored += check_ignore(dir, prefix,
@@ -135,16 +148,19 @@ static int check_ignore_stdin_paths(struct dir_struct *dir, const char *prefix)
 		maybe_flush_or_die(stdout, "check-ignore to stdout");
 	}
 	strbuf_release(&buf);
-	strbuf_release(&nbuf);
+	strbuf_release(&unquoted);
 	return num_ignored;
 }
 
-int cmd_check_ignore(int argc, const char **argv, const char *prefix)
+int cmd_check_ignore(int argc,
+		     const char **argv,
+		     const char *prefix,
+		     struct repository *repo UNUSED)
 {
 	int num_ignored;
-	struct dir_struct dir;
+	struct dir_struct dir = DIR_INIT;
 
-	git_config(git_default_config, NULL);
+	repo_config(the_repository, git_default_config, NULL);
 
 	argc = parse_options(argc, argv, prefix, check_ignore_options,
 			     check_ignore_usage, 0);
@@ -168,10 +184,9 @@ int cmd_check_ignore(int argc, const char **argv, const char *prefix)
 		die(_("--non-matching is only valid with --verbose"));
 
 	/* read_cache() is only necessary so we can watch out for submodules. */
-	if (!no_index && read_cache() < 0)
+	if (!no_index && repo_read_index(the_repository) < 0)
 		die(_("index file corrupt"));
 
-	memset(&dir, 0, sizeof(dir));
 	setup_standard_excludes(&dir);
 
 	if (stdin_paths) {
@@ -181,7 +196,7 @@ int cmd_check_ignore(int argc, const char **argv, const char *prefix)
 		maybe_flush_or_die(stdout, "ignore to stdout");
 	}
 
-	clear_directory(&dir);
+	dir_clear(&dir);
 
 	return !num_ignored;
 }

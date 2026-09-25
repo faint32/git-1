@@ -50,6 +50,10 @@ test_expect_success 'git diff-tree HEAD HEAD' '
 	test_expect_code 0 git diff-tree --quiet HEAD HEAD >cnt &&
 	test_line_count = 0 cnt
 '
+test_expect_success 'git diff-tree -w HEAD^ HEAD' '
+	test_expect_code 1 git diff-tree --quiet -w HEAD^ HEAD >cnt &&
+	test_line_count = 0 cnt
+'
 test_expect_success 'git diff-files' '
 	test_expect_code 0 git diff-files --quiet >cnt &&
 	test_line_count = 0 cnt
@@ -147,9 +151,18 @@ test_expect_success 'git diff --ignore-all-space, both files outside repo' '
 '
 
 test_expect_success 'git diff --quiet ignores stat-change only entries' '
-	test-chmtime +10 a &&
+	test-tool chmtime +10 a &&
 	echo modified >>b &&
 	test_expect_code 1 git diff --quiet
+'
+
+test_expect_success 'git diff --quiet on a path that need conversion' '
+	echo "crlf.txt text=auto" >.gitattributes &&
+	printf "Hello\r\nWorld\r\n" >crlf.txt &&
+	git add .gitattributes crlf.txt &&
+
+	printf "Hello\r\nWorld\n" >crlf.txt &&
+	git diff --quiet crlf.txt
 '
 
 test_done

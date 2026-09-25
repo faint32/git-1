@@ -1,7 +1,14 @@
 #!/bin/sh
 
 test_description='git blame encoding conversion'
+
 . ./test-lib.sh
+
+if ! test_have_prereq ICONV
+then
+	skip_all='skipping blame i18n tests; iconv not available'
+	test_done
+fi
 
 . "$TEST_DIRECTORY"/t8005/utf8.txt
 . "$TEST_DIRECTORY"/t8005/euc-japan.txt
@@ -33,11 +40,15 @@ author $SJIS_NAME
 summary $SJIS_MSG
 EOF
 
+filter_author_summary () {
+	sed -n -e '/^author /p' -e '/^summary /p' "$@"
+}
+
 test_expect_success !MINGW \
 	'blame respects i18n.commitencoding' '
-	git blame --incremental file | \
-		egrep "^(author|summary) " > actual &&
-	test_cmp actual expected
+	git blame --incremental file >output &&
+	filter_author_summary output >actual &&
+	test_cmp expected actual
 '
 
 cat >expected <<EOF
@@ -52,9 +63,9 @@ EOF
 test_expect_success !MINGW \
 	'blame respects i18n.logoutputencoding' '
 	git config i18n.logoutputencoding eucJP &&
-	git blame --incremental file | \
-		egrep "^(author|summary) " > actual &&
-	test_cmp actual expected
+	git blame --incremental file >output &&
+	filter_author_summary output >actual &&
+	test_cmp expected actual
 '
 
 cat >expected <<EOF
@@ -68,9 +79,9 @@ EOF
 
 test_expect_success !MINGW \
 	'blame respects --encoding=UTF-8' '
-	git blame --incremental --encoding=UTF-8 file | \
-		egrep "^(author|summary) " > actual &&
-	test_cmp actual expected
+	git blame --incremental --encoding=UTF-8 file >output &&
+	filter_author_summary output >actual &&
+	test_cmp expected actual
 '
 
 cat >expected <<EOF
@@ -84,9 +95,9 @@ EOF
 
 test_expect_success !MINGW \
 	'blame respects --encoding=none' '
-	git blame --incremental --encoding=none file | \
-		egrep "^(author|summary) " > actual &&
-	test_cmp actual expected
+	git blame --incremental --encoding=none file >output &&
+	filter_author_summary output >actual &&
+	test_cmp expected actual
 '
 
 test_done

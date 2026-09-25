@@ -1,13 +1,26 @@
-#include "cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
+#include "abspath.h"
+#include "config.h"
+#include "copy.h"
+#include "environment.h"
+#include "gettext.h"
+#include "hex.h"
 #include "lockfile.h"
 #include "string-list.h"
+#include "read-cache-ll.h"
 #include "rerere.h"
 #include "xdiff-interface.h"
 #include "dir.h"
 #include "resolve-undo.h"
-#include "ll-merge.h"
-#include "attr.h"
+#include "merge-ll.h"
+#include "path.h"
 #include "pathspec.h"
+#include "object-file.h"
+#include "odb.h"
+#include "strmap.h"
 
 #define RESOLVED 0
 #define PUNTED 1
@@ -20,45 +33,210 @@ static int rerere_enabled = -1;
 /* automatically update cleanly resolved paths to the index */
 static int rerere_autoupdate;
 
-const char *rerere_path(const char *hex, const char *file)
+#define RR_HAS_POSTIMAGE 1
+#define RR_HAS_PREIMAGE 2
+struct rerere_dir {
+	int status_alloc, status_nr;
+	unsigned char *status;
+	char name[FLEX_ARRAY];
+};
+
+static struct strmap rerere_dirs = STRMAP_INIT;
+
+static void free_rerere_dirs(void)
 {
-	return git_path("rr-cache/%s/%s", hex, file);
+	struct hashmap_iter iter;
+	struct strmap_entry *ent;
+
+	strmap_for_each_entry(&rerere_dirs, &iter, ent) {
+		struct rerere_dir *rr_dir = ent->value;
+		free(rr_dir->status);
+		free(rr_dir);
+	}
+	strmap_clear(&rerere_dirs, 0);
 }
 
-static int has_rerere_resolution(const char *hex)
+static void free_rerere_id(struct string_list_item *item)
 {
-	struct stat st;
-	return !stat(rerere_path(hex, "postimage"), &st);
+	free(item->util);
 }
 
-static void read_rr(struct string_list *rr)
+static const char *rerere_id_hex(const struct rerere_id *id)
 {
-	unsigned char sha1[20];
-	char buf[PATH_MAX];
-	FILE *in = fopen(git_path_merge_rr(), "r");
+	return id->collection->name;
+}
+
+static void fit_variant(struct rerere_dir *rr_dir, int variant)
+{
+	variant++;
+	ALLOC_GROW(rr_dir->status, variant, rr_dir->status_alloc);
+	if (rr_dir->status_nr < variant) {
+		memset(rr_dir->status + rr_dir->status_nr,
+		       '\0', variant - rr_dir->status_nr);
+		rr_dir->status_nr = variant;
+	}
+}
+
+static void assign_variant(struct rerere_id *id)
+{
+	int variant;
+	struct rerere_dir *rr_dir = id->collection;
+
+	variant = id->variant;
+	if (variant < 0) {
+		for (variant = 0; variant < rr_dir->status_nr; variant++)
+			if (!rr_dir->status[variant])
+				break;
+	}
+	fit_variant(rr_dir, variant);
+	id->variant = variant;
+}
+
+const char *rerere_path(struct strbuf *buf, const struct rerere_id *id, const char *file)
+{
+	if (!file)
+		return repo_git_path_replace(the_repository, buf, "rr-cache/%s",
+					     rerere_id_hex(id));
+
+	if (id->variant <= 0)
+		return repo_git_path_replace(the_repository, buf, "rr-cache/%s/%s",
+					     rerere_id_hex(id), file);
+
+	return repo_git_path_replace(the_repository, buf, "rr-cache/%s/%s.%d",
+				     rerere_id_hex(id), file, id->variant);
+}
+
+static int is_rr_file(const char *name, const char *filename, int *variant)
+{
+	const char *suffix;
+	char *ep;
+
+	if (!strcmp(name, filename)) {
+		*variant = 0;
+		return 1;
+	}
+	if (!skip_prefix(name, filename, &suffix) || *suffix != '.')
+		return 0;
+
+	errno = 0;
+	*variant = strtol(suffix + 1, &ep, 10);
+	if (errno || *ep)
+		return 0;
+	return 1;
+}
+
+static void scan_rerere_dir(struct rerere_dir *rr_dir)
+{
+	struct dirent *de;
+	char *path;
+	DIR *dir;
+
+	path = repo_git_path(the_repository, "rr-cache/%s", rr_dir->name);
+	dir = opendir(path);
+	free(path);
+	if (!dir)
+		return;
+	while ((de = readdir(dir)) != NULL) {
+		int variant;
+
+		if (is_rr_file(de->d_name, "postimage", &variant)) {
+			fit_variant(rr_dir, variant);
+			rr_dir->status[variant] |= RR_HAS_POSTIMAGE;
+		} else if (is_rr_file(de->d_name, "preimage", &variant)) {
+			fit_variant(rr_dir, variant);
+			rr_dir->status[variant] |= RR_HAS_PREIMAGE;
+		}
+	}
+	closedir(dir);
+}
+
+static struct rerere_dir *find_rerere_dir(const char *hex)
+{
+	struct rerere_dir *rr_dir;
+
+	rr_dir = strmap_get(&rerere_dirs, hex);
+	if (!rr_dir) {
+		FLEX_ALLOC_STR(rr_dir, name, hex);
+		rr_dir->status = NULL;
+		rr_dir->status_nr = 0;
+		rr_dir->status_alloc = 0;
+		strmap_put(&rerere_dirs, hex, rr_dir);
+
+		scan_rerere_dir(rr_dir);
+	}
+	return rr_dir;
+}
+
+static int has_rerere_resolution(const struct rerere_id *id)
+{
+	const int both = RR_HAS_POSTIMAGE|RR_HAS_PREIMAGE;
+	int variant = id->variant;
+
+	if (variant < 0)
+		return 0;
+	return ((id->collection->status[variant] & both) == both);
+}
+
+static struct rerere_id *new_rerere_id_hex(char *hex)
+{
+	struct rerere_id *id = xmalloc(sizeof(*id));
+	id->collection = find_rerere_dir(hex);
+	id->variant = -1; /* not known yet */
+	return id;
+}
+
+static struct rerere_id *new_rerere_id(unsigned char *hash)
+{
+	return new_rerere_id_hex(hash_to_hex(hash));
+}
+
+/*
+ * $GIT_DIR/MERGE_RR file is a collection of records, each of which is
+ * "conflict ID", a HT and pathname, terminated with a NUL, and is
+ * used to keep track of the set of paths that "rerere" may need to
+ * work on (i.e. what is left by the previous invocation of "git
+ * rerere" during the current conflict resolution session).
+ */
+static void read_rr(struct repository *r, struct string_list *rr)
+{
+	struct strbuf buf = STRBUF_INIT;
+	FILE *in = fopen_or_warn(git_path_merge_rr(r), "r");
+
 	if (!in)
 		return;
-	while (fread(buf, 40, 1, in) == 1) {
-		int i;
-		char *name;
-		if (get_sha1_hex(buf, sha1))
-			die("corrupt MERGE_RR");
-		buf[40] = '\0';
-		name = xstrdup(buf);
-		if (fgetc(in) != '\t')
-			die("corrupt MERGE_RR");
-		for (i = 0; i < sizeof(buf); i++) {
-			int c = fgetc(in);
-			if (c < 0)
-				die("corrupt MERGE_RR");
-			buf[i] = c;
-			if (c == 0)
-				 break;
+	while (!strbuf_getwholeline(&buf, in, '\0')) {
+		char *path;
+		unsigned char hash[GIT_MAX_RAWSZ];
+		struct rerere_id *id;
+		int variant;
+		const unsigned hexsz = the_hash_algo->hexsz;
+
+		/* There has to be the hash, tab, path and then NUL */
+		if (buf.len < hexsz + 2 || get_hash_hex(buf.buf, hash))
+			die(_("corrupt MERGE_RR"));
+
+		if (buf.buf[hexsz] != '.') {
+			variant = 0;
+			path = buf.buf + hexsz;
+		} else {
+			errno = 0;
+			variant = strtol(buf.buf + hexsz + 1, &path, 10);
+			if (errno)
+				die(_("corrupt MERGE_RR"));
 		}
-		if (i == sizeof(buf))
-			die("filename too long");
-		string_list_insert(rr, buf)->util = name;
+		if (*(path++) != '\t')
+			die(_("corrupt MERGE_RR"));
+		buf.buf[hexsz] = '\0';
+		id = new_rerere_id_hex(buf.buf);
+		id->variant = variant;
+		/*
+		 * make sure id->collection->status has enough space
+		 * for the variant we are interested in
+		 */
+		fit_variant(id->collection, variant);
+		string_list_insert(rr, path)->util = id;
 	}
+	strbuf_release(&buf);
 	fclose(in);
 }
 
@@ -68,21 +246,48 @@ static int write_rr(struct string_list *rr, int out_fd)
 {
 	int i;
 	for (i = 0; i < rr->nr; i++) {
-		const char *path;
-		int length;
-		if (!rr->items[i].util)
+		struct strbuf buf = STRBUF_INIT;
+		struct rerere_id *id;
+
+		assert(rr->items[i].util != RERERE_RESOLVED);
+
+		id = rr->items[i].util;
+		if (!id)
 			continue;
-		path = rr->items[i].string;
-		length = strlen(path) + 1;
-		if (write_in_full(out_fd, rr->items[i].util, 40) != 40 ||
-		    write_str_in_full(out_fd, "\t") != 1 ||
-		    write_in_full(out_fd, path, length) != length)
-			die("unable to write rerere record");
+		assert(id->variant >= 0);
+		if (0 < id->variant)
+			strbuf_addf(&buf, "%s.%d\t%s%c",
+				    rerere_id_hex(id), id->variant,
+				    rr->items[i].string, 0);
+		else
+			strbuf_addf(&buf, "%s\t%s%c",
+				    rerere_id_hex(id),
+				    rr->items[i].string, 0);
+
+		if (write_in_full(out_fd, buf.buf, buf.len) < 0)
+			die(_("unable to write rerere record"));
+
+		strbuf_release(&buf);
 	}
 	if (commit_lock_file(&write_lock) != 0)
-		die("unable to write rerere record");
+		die(_("unable to write rerere record"));
 	return 0;
 }
+
+/*
+ * "rerere" interacts with conflicted file contents using this I/O
+ * abstraction.  It reads a conflicted contents from one place via
+ * "getline()" method, and optionally can write it out after
+ * normalizing the conflicted hunks to the "output".  Subclasses of
+ * rerere_io embed this structure at the beginning of their own
+ * rerere_io object.
+ */
+struct rerere_io {
+	int (*getline)(struct strbuf *, struct rerere_io *);
+	FILE *output;
+	int wrerror;
+	/* some more stuff */
+};
 
 static void ferr_write(const void *p, size_t count, FILE *fp, int *err)
 {
@@ -97,39 +302,10 @@ static inline void ferr_puts(const char *s, FILE *fp, int *err)
 	ferr_write(s, strlen(s), fp, err);
 }
 
-struct rerere_io {
-	int (*getline)(struct strbuf *, struct rerere_io *);
-	FILE *output;
-	int wrerror;
-	/* some more stuff */
-};
-
 static void rerere_io_putstr(const char *str, struct rerere_io *io)
 {
 	if (io->output)
 		ferr_puts(str, io->output, &io->wrerror);
-}
-
-static void rerere_io_putconflict(int ch, int size, struct rerere_io *io)
-{
-	char buf[64];
-
-	while (size) {
-		if (size < sizeof(buf) - 2) {
-			memset(buf, ch, size);
-			buf[size] = '\n';
-			buf[size + 1] = '\0';
-			size = 0;
-		} else {
-			int sz = sizeof(buf) - 1;
-			if (size <= sz)
-				sz -= (sz - size) + 1;
-			memset(buf, ch, sz);
-			buf[sz] = '\0';
-			size -= sz;
-		}
-		rerere_io_putstr(buf, io);
-	}
 }
 
 static void rerere_io_putmem(const char *mem, size_t sz, struct rerere_io *io)
@@ -138,143 +314,615 @@ static void rerere_io_putmem(const char *mem, size_t sz, struct rerere_io *io)
 		ferr_write(mem, sz, io->output, &io->wrerror);
 }
 
+/*
+ * Subclass of rerere_io that reads from an on-disk file
+ */
 struct rerere_io_file {
 	struct rerere_io io;
 	FILE *input;
 };
 
+/*
+ * ... and its getline() method implementation
+ */
 static int rerere_file_getline(struct strbuf *sb, struct rerere_io *io_)
 {
 	struct rerere_io_file *io = (struct rerere_io_file *)io_;
 	return strbuf_getwholeline(sb, io->input, '\n');
 }
 
-static int is_cmarker(char *buf, int marker_char, int marker_size, int want_sp)
+static void rerere_strbuf_putconflict(struct strbuf *buf, int ch, size_t size)
 {
-	while (marker_size--)
-		if (*buf++ != marker_char)
-			return 0;
-	if (want_sp && *buf != ' ')
-		return 0;
-	return isspace(*buf);
+	strbuf_addchars(buf, ch, size);
+	strbuf_addch(buf, '\n');
 }
 
-static int handle_path(unsigned char *sha1, struct rerere_io *io, int marker_size)
+static int handle_conflict(struct strbuf *out, struct rerere_io *io,
+			   int marker_size, struct git_hash_ctx *ctx)
 {
-	git_SHA_CTX ctx;
-	int hunk_no = 0;
 	enum {
-		RR_CONTEXT = 0, RR_SIDE_1, RR_SIDE_2, RR_ORIGINAL
-	} hunk = RR_CONTEXT;
+		RR_SIDE_1 = 0, RR_SIDE_2, RR_ORIGINAL
+	} hunk = RR_SIDE_1;
 	struct strbuf one = STRBUF_INIT, two = STRBUF_INIT;
-	struct strbuf buf = STRBUF_INIT;
-
-	if (sha1)
-		git_SHA1_Init(&ctx);
+	struct strbuf buf = STRBUF_INIT, conflict = STRBUF_INIT;
+	int has_conflicts = -1;
 
 	while (!io->getline(&buf, io)) {
-		if (is_cmarker(buf.buf, '<', marker_size, 1)) {
-			if (hunk != RR_CONTEXT)
-				goto bad;
-			hunk = RR_SIDE_1;
-		} else if (is_cmarker(buf.buf, '|', marker_size, 0)) {
+		int marker = is_conflict_marker_line(buf.buf, buf.len, marker_size);
+		if (marker == '<') {
+			if (handle_conflict(&conflict, io, marker_size, NULL) < 0)
+				break;
+			if (hunk == RR_SIDE_1)
+				strbuf_addbuf(&one, &conflict);
+			else
+				strbuf_addbuf(&two, &conflict);
+			strbuf_release(&conflict);
+		} else if (marker == '|') {
 			if (hunk != RR_SIDE_1)
-				goto bad;
+				break;
 			hunk = RR_ORIGINAL;
-		} else if (is_cmarker(buf.buf, '=', marker_size, 0)) {
+		} else if (marker == '=') {
 			if (hunk != RR_SIDE_1 && hunk != RR_ORIGINAL)
-				goto bad;
+				break;
 			hunk = RR_SIDE_2;
-		} else if (is_cmarker(buf.buf, '>', marker_size, 1)) {
+		} else if (marker == '>') {
 			if (hunk != RR_SIDE_2)
-				goto bad;
+				break;
 			if (strbuf_cmp(&one, &two) > 0)
 				strbuf_swap(&one, &two);
-			hunk_no++;
-			hunk = RR_CONTEXT;
-			rerere_io_putconflict('<', marker_size, io);
-			rerere_io_putmem(one.buf, one.len, io);
-			rerere_io_putconflict('=', marker_size, io);
-			rerere_io_putmem(two.buf, two.len, io);
-			rerere_io_putconflict('>', marker_size, io);
-			if (sha1) {
-				git_SHA1_Update(&ctx, one.buf ? one.buf : "",
-					    one.len + 1);
-				git_SHA1_Update(&ctx, two.buf ? two.buf : "",
-					    two.len + 1);
+			has_conflicts = 1;
+			rerere_strbuf_putconflict(out, '<', marker_size);
+			strbuf_addbuf(out, &one);
+			rerere_strbuf_putconflict(out, '=', marker_size);
+			strbuf_addbuf(out, &two);
+			rerere_strbuf_putconflict(out, '>', marker_size);
+			if (ctx) {
+				git_hash_update(ctx, one.buf, one.len + 1);
+				git_hash_update(ctx, two.buf, two.len + 1);
 			}
-			strbuf_reset(&one);
-			strbuf_reset(&two);
+			break;
 		} else if (hunk == RR_SIDE_1)
 			strbuf_addbuf(&one, &buf);
 		else if (hunk == RR_ORIGINAL)
 			; /* discard */
 		else if (hunk == RR_SIDE_2)
 			strbuf_addbuf(&two, &buf);
-		else
-			rerere_io_putstr(buf.buf, io);
-		continue;
-	bad:
-		hunk = 99; /* force error exit */
-		break;
 	}
 	strbuf_release(&one);
 	strbuf_release(&two);
 	strbuf_release(&buf);
 
-	if (sha1)
-		git_SHA1_Final(sha1, &ctx);
-	if (hunk != RR_CONTEXT)
-		return -1;
-	return hunk_no;
+	return has_conflicts;
 }
 
-static int handle_file(const char *path, unsigned char *sha1, const char *output)
+/*
+ * Read contents a file with conflicts, normalize the conflicts
+ * by (1) discarding the common ancestor version in diff3-style,
+ * (2) reordering our side and their side so that whichever sorts
+ * alphabetically earlier comes before the other one, while
+ * computing the "conflict ID", which is just an SHA-1 hash of
+ * one side of the conflict, NUL, the other side of the conflict,
+ * and NUL concatenated together.
+ *
+ * Return 1 if conflict hunks are found, 0 if there are no conflict
+ * hunks and -1 if an error occurred.
+ */
+static int handle_path(unsigned char *hash, struct rerere_io *io, int marker_size)
 {
-	int hunk_no = 0;
+	struct git_hash_ctx ctx;
+	struct strbuf buf = STRBUF_INIT, out = STRBUF_INIT;
+	int has_conflicts = 0;
+	if (hash)
+		git_hash_init(&ctx, the_hash_algo);
+
+	while (!io->getline(&buf, io)) {
+		if (is_conflict_marker_line(buf.buf, buf.len, marker_size) == '<') {
+			has_conflicts = handle_conflict(&out, io, marker_size,
+							hash ? &ctx : NULL);
+			if (has_conflicts < 0)
+				break;
+			rerere_io_putmem(out.buf, out.len, io);
+			strbuf_reset(&out);
+		} else
+			rerere_io_putstr(buf.buf, io);
+	}
+	strbuf_release(&buf);
+	strbuf_release(&out);
+
+	if (hash)
+		git_hash_final(hash, &ctx);
+
+	return has_conflicts;
+}
+
+/*
+ * Scan the path for conflicts, do the "handle_path()" thing above, and
+ * return the number of conflict hunks found.
+ */
+static int handle_file(struct index_state *istate,
+		       const char *path, unsigned char *hash, const char *output)
+{
+	int has_conflicts = 0;
 	struct rerere_io_file io;
-	int marker_size = ll_merge_marker_size(path);
+	int marker_size = ll_merge_marker_size(istate, path);
 
 	memset(&io, 0, sizeof(io));
 	io.io.getline = rerere_file_getline;
 	io.input = fopen(path, "r");
 	io.io.wrerror = 0;
 	if (!io.input)
-		return error("Could not open %s", path);
+		return error_errno(_("could not open '%s'"), path);
 
 	if (output) {
 		io.io.output = fopen(output, "w");
 		if (!io.io.output) {
+			error_errno(_("could not write '%s'"), output);
 			fclose(io.input);
-			return error("Could not write %s", output);
+			return -1;
 		}
 	}
 
-	hunk_no = handle_path(sha1, (struct rerere_io *)&io, marker_size);
+	has_conflicts = handle_path(hash, (struct rerere_io *)&io, marker_size);
 
 	fclose(io.input);
 	if (io.io.wrerror)
-		error("There were errors while writing %s (%s)",
+		error(_("there were errors while writing '%s' (%s)"),
 		      path, strerror(io.io.wrerror));
 	if (io.io.output && fclose(io.io.output))
-		io.io.wrerror = error("Failed to flush %s: %s",
-				      path, strerror(errno));
+		io.io.wrerror = error_errno(_("failed to flush '%s'"), path);
 
-	if (hunk_no < 0) {
+	if (has_conflicts < 0) {
 		if (output)
 			unlink_or_warn(output);
-		return error("Could not parse conflict hunks in %s", path);
+		return error(_("could not parse conflict hunks in '%s'"), path);
 	}
 	if (io.io.wrerror)
 		return -1;
-	return hunk_no;
+	return has_conflicts;
 }
 
+/*
+ * Look at a cache entry at "i" and see if it is not conflicting,
+ * conflicting and we are willing to handle, or conflicting and
+ * we are unable to handle, and return the determination in *type.
+ * Return the cache index to be looked at next, by skipping the
+ * stages we have already looked at in this invocation of this
+ * function.
+ */
+static int check_one_conflict(struct index_state *istate, int i, int *type)
+{
+	const struct cache_entry *e = istate->cache[i];
+
+	if (!ce_stage(e)) {
+		*type = RESOLVED;
+		return i + 1;
+	}
+
+	*type = PUNTED;
+	while (i < istate->cache_nr && ce_stage(istate->cache[i]) == 1)
+		i++;
+
+	/* Only handle regular files with both stages #2 and #3 */
+	if (i + 1 < istate->cache_nr) {
+		const struct cache_entry *e2 = istate->cache[i];
+		const struct cache_entry *e3 = istate->cache[i + 1];
+		if (ce_stage(e2) == 2 &&
+		    ce_stage(e3) == 3 &&
+		    ce_same_name(e, e3) &&
+		    S_ISREG(e2->ce_mode) &&
+		    S_ISREG(e3->ce_mode))
+			*type = THREE_STAGED;
+	}
+
+	/* Skip the entries with the same name */
+	while (i < istate->cache_nr && ce_same_name(e, istate->cache[i]))
+		i++;
+	return i;
+}
+
+/*
+ * Scan the index and find paths that have conflicts that rerere can
+ * handle, i.e. the ones that have both stages #2 and #3.
+ *
+ * NEEDSWORK: we do not record or replay a previous "resolve by
+ * deletion" for a delete-modify conflict, as that is inherently risky
+ * without knowing what modification is being discarded.  The only
+ * safe case, i.e. both side doing the deletion and modification that
+ * are identical to the previous round, might want to be handled,
+ * though.
+ */
+static int find_conflict(struct repository *r, struct string_list *conflict)
+{
+	int i;
+
+	if (repo_read_index(r) < 0)
+		return error(_("index file corrupt"));
+
+	for (i = 0; i < r->index->cache_nr;) {
+		int conflict_type;
+		const struct cache_entry *e = r->index->cache[i];
+		i = check_one_conflict(r->index, i, &conflict_type);
+		if (conflict_type == THREE_STAGED)
+			string_list_insert(conflict, (const char *)e->name);
+	}
+	return 0;
+}
+
+/*
+ * The merge_rr list is meant to hold outstanding conflicted paths
+ * that rerere could handle.  Abuse the list by adding other types of
+ * entries to allow the caller to show "rerere remaining".
+ *
+ * - Conflicted paths that rerere does not handle are added
+ * - Conflicted paths that have been resolved are marked as such
+ *   by storing RERERE_RESOLVED to .util field (where conflict ID
+ *   is expected to be stored).
+ *
+ * Do *not* write MERGE_RR file out after calling this function.
+ *
+ * NEEDSWORK: we may want to fix the caller that implements "rerere
+ * remaining" to do this without abusing merge_rr.
+ */
+int rerere_remaining(struct repository *r, struct string_list *merge_rr)
+{
+	int i;
+
+	if (setup_rerere(r, merge_rr, RERERE_READONLY))
+		return 0;
+	if (repo_read_index(r) < 0)
+		return error(_("index file corrupt"));
+
+	for (i = 0; i < r->index->cache_nr;) {
+		int conflict_type;
+		const struct cache_entry *e = r->index->cache[i];
+		i = check_one_conflict(r->index, i, &conflict_type);
+		if (conflict_type == PUNTED)
+			string_list_insert(merge_rr, (const char *)e->name);
+		else if (conflict_type == RESOLVED) {
+			struct string_list_item *it;
+			it = string_list_lookup(merge_rr, (const char *)e->name);
+			if (it) {
+				free_rerere_id(it);
+				it->util = RERERE_RESOLVED;
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * Try using the given conflict resolution "ID" to see
+ * if that recorded conflict resolves cleanly what we
+ * got in the "cur".
+ */
+static int try_merge(struct index_state *istate,
+		     const struct rerere_id *id, const char *path,
+		     mmfile_t *cur, mmbuffer_t *result)
+{
+	enum ll_merge_result ret;
+	mmfile_t base = {NULL, 0}, other = {NULL, 0};
+	struct strbuf buf = STRBUF_INIT;
+
+	if (read_mmfile(&base, rerere_path(&buf, id, "preimage")) ||
+	    read_mmfile(&other, rerere_path(&buf, id, "postimage"))) {
+		ret = LL_MERGE_CONFLICT;
+	} else {
+		/*
+		 * A three-way merge. Note that this honors user-customizable
+		 * low-level merge driver settings.
+		 */
+		ret = ll_merge(result, path, &base, NULL, cur, "", &other, "",
+			       istate, NULL);
+	}
+
+	strbuf_release(&buf);
+	free(base.ptr);
+	free(other.ptr);
+
+	return ret;
+}
+
+/*
+ * Find the conflict identified by "id"; the change between its
+ * "preimage" (i.e. a previous contents with conflict markers) and its
+ * "postimage" (i.e. the corresponding contents with conflicts
+ * resolved) may apply cleanly to the contents stored in "path", i.e.
+ * the conflict this time around.
+ *
+ * Returns 0 for successful replay of recorded resolution, or non-zero
+ * for failure.
+ */
+static int merge(struct index_state *istate, const struct rerere_id *id, const char *path)
+{
+	FILE *f;
+	int ret;
+	struct strbuf buf = STRBUF_INIT;
+	mmfile_t cur = {NULL, 0};
+	mmbuffer_t result = {NULL, 0};
+
+	/*
+	 * Normalize the conflicts in path and write it out to
+	 * "thisimage" temporary file.
+	 */
+	if ((handle_file(istate, path, NULL, rerere_path(&buf, id, "thisimage")) < 0) ||
+	    read_mmfile(&cur, rerere_path(&buf, id, "thisimage"))) {
+		ret = 1;
+		goto out;
+	}
+
+	ret = try_merge(istate, id, path, &cur, &result);
+	if (ret)
+		goto out;
+
+	/*
+	 * A successful replay of recorded resolution.
+	 * Mark that "postimage" was used to help gc.
+	 */
+	if (utime(rerere_path(&buf, id, "postimage"), NULL) < 0)
+		warning_errno(_("failed utime() on '%s'"),
+			      rerere_path(&buf, id, "postimage"));
+
+	/* Update "path" with the resolution */
+	f = fopen(path, "w");
+	if (!f)
+		return error_errno(_("could not open '%s'"), path);
+	if (fwrite(result.ptr, result.size, 1, f) != 1)
+		error_errno(_("could not write '%s'"), path);
+	if (fclose(f))
+		return error_errno(_("writing '%s' failed"), path);
+
+out:
+	free(cur.ptr);
+	free(result.ptr);
+	strbuf_release(&buf);
+
+	return ret;
+}
+
+static void update_paths(struct repository *r, struct string_list *update)
+{
+	struct lock_file index_lock = LOCK_INIT;
+	int i;
+
+	repo_hold_locked_index(r, &index_lock, LOCK_DIE_ON_ERROR);
+
+	for (i = 0; i < update->nr; i++) {
+		struct string_list_item *item = &update->items[i];
+		if (add_file_to_index(r->index, item->string, 0))
+			exit(128);
+		fprintf_ln(stderr, _("Staged '%s' using previous resolution."),
+			item->string);
+	}
+
+	if (write_locked_index(r->index, &index_lock,
+			       COMMIT_LOCK | SKIP_IF_UNCHANGED))
+		die(_("unable to write new index file"));
+}
+
+static void remove_variant(struct rerere_id *id)
+{
+	struct strbuf buf = STRBUF_INIT;
+	unlink_or_warn(rerere_path(&buf, id, "postimage"));
+	unlink_or_warn(rerere_path(&buf, id, "preimage"));
+	id->collection->status[id->variant] = 0;
+	strbuf_release(&buf);
+}
+
+/*
+ * The path indicated by rr_item may still have conflict for which we
+ * have a recorded resolution, in which case replay it and optionally
+ * update it.  Or it may have been resolved by the user and we may
+ * only have the preimage for that conflict, in which case the result
+ * needs to be recorded as a resolution in a postimage file.
+ */
+static void do_rerere_one_path(struct index_state *istate,
+			       struct string_list_item *rr_item,
+			       struct string_list *update)
+{
+	const char *path = rr_item->string;
+	struct rerere_id *id = rr_item->util;
+	struct rerere_dir *rr_dir = id->collection;
+	struct strbuf buf = STRBUF_INIT;
+	int variant;
+
+	variant = id->variant;
+
+	/* Has the user resolved it already? */
+	if (variant >= 0) {
+		if (!handle_file(istate, path, NULL, NULL)) {
+			copy_file(the_repository, rerere_path(&buf, id, "postimage"), path, 0666);
+			id->collection->status[variant] |= RR_HAS_POSTIMAGE;
+			fprintf_ln(stderr, _("Recorded resolution for '%s'."), path);
+			free_rerere_id(rr_item);
+			rr_item->util = NULL;
+			goto out;
+		}
+		/*
+		 * There may be other variants that can cleanly
+		 * replay.  Try them and update the variant number for
+		 * this one.
+		 */
+	}
+
+	/* Does any existing resolution apply cleanly? */
+	for (variant = 0; variant < rr_dir->status_nr; variant++) {
+		const int both = RR_HAS_PREIMAGE | RR_HAS_POSTIMAGE;
+		struct rerere_id vid = *id;
+
+		if ((rr_dir->status[variant] & both) != both)
+			continue;
+
+		vid.variant = variant;
+		if (merge(istate, &vid, path))
+			continue; /* failed to replay */
+
+		/*
+		 * If there already is a different variant that applies
+		 * cleanly, there is no point maintaining our own variant.
+		 */
+		if (0 <= id->variant && id->variant != variant)
+			remove_variant(id);
+
+		if (rerere_autoupdate)
+			string_list_insert(update, path);
+		else
+			fprintf_ln(stderr,
+				   _("Resolved '%s' using previous resolution."),
+				   path);
+		free_rerere_id(rr_item);
+		rr_item->util = NULL;
+		goto out;
+	}
+
+	/* None of the existing one applies; we need a new variant */
+	assign_variant(id);
+
+	variant = id->variant;
+	handle_file(istate, path, NULL, rerere_path(&buf, id, "preimage"));
+	if (id->collection->status[variant] & RR_HAS_POSTIMAGE) {
+		const char *path = rerere_path(&buf, id, "postimage");
+		if (unlink(path))
+			die_errno(_("cannot unlink stray '%s'"), path);
+		id->collection->status[variant] &= ~RR_HAS_POSTIMAGE;
+	}
+	id->collection->status[variant] |= RR_HAS_PREIMAGE;
+	fprintf_ln(stderr, _("Recorded preimage for '%s'"), path);
+
+out:
+	strbuf_release(&buf);
+}
+
+static int do_plain_rerere(struct repository *r,
+			   struct string_list *rr, int fd)
+{
+	struct string_list conflict = STRING_LIST_INIT_DUP;
+	struct string_list update = STRING_LIST_INIT_DUP;
+	struct strbuf buf = STRBUF_INIT;
+	int i;
+
+	find_conflict(r, &conflict);
+
+	/*
+	 * MERGE_RR records paths with conflicts immediately after
+	 * merge failed.  Some of the conflicted paths might have been
+	 * hand resolved in the working tree since then, but the
+	 * initial run would catch all and register their preimages.
+	 */
+	for (i = 0; i < conflict.nr; i++) {
+		struct rerere_id *id;
+		unsigned char hash[GIT_MAX_RAWSZ];
+		const char *path = conflict.items[i].string;
+		int ret;
+
+		/*
+		 * Ask handle_file() to scan and assign a
+		 * conflict ID.  No need to write anything out
+		 * yet.
+		 */
+		ret = handle_file(r->index, path, hash, NULL);
+		if (ret != 0 && string_list_has_string(rr, path)) {
+			remove_variant(string_list_lookup(rr, path)->util);
+			string_list_remove(rr, path, 1);
+		}
+		if (ret < 1)
+			continue;
+
+		id = new_rerere_id(hash);
+		string_list_insert(rr, path)->util = id;
+
+		/* Ensure that the directory exists. */
+		safe_create_dir_in_gitdir(the_repository, rerere_path(&buf, id, NULL));
+	}
+
+	for (i = 0; i < rr->nr; i++)
+		do_rerere_one_path(r->index, &rr->items[i], &update);
+
+	if (update.nr)
+		update_paths(r, &update);
+
+	string_list_clear(&conflict, 0);
+	string_list_clear(&update, 0);
+	strbuf_release(&buf);
+	return write_rr(rr, fd);
+}
+
+static void git_rerere_config(void)
+{
+	repo_config_get_bool(the_repository, "rerere.enabled", &rerere_enabled);
+	repo_config_get_bool(the_repository, "rerere.autoupdate", &rerere_autoupdate);
+	repo_config(the_repository, git_default_config, NULL);
+}
+
+static GIT_PATH_FUNC(git_path_rr_cache, "rr-cache")
+
+static int is_rerere_enabled(void)
+{
+	int rr_cache_exists;
+
+	if (!rerere_enabled)
+		return 0;
+
+	rr_cache_exists = is_directory(git_path_rr_cache());
+	if (rerere_enabled < 0)
+		return rr_cache_exists;
+
+	if (!rr_cache_exists &&
+	    safe_create_dir_in_gitdir(the_repository, git_path_rr_cache()))
+		die(_("could not create directory '%s'"), git_path_rr_cache());
+	return 1;
+}
+
+int setup_rerere(struct repository *r, struct string_list *merge_rr, int flags)
+{
+	int fd;
+
+	git_rerere_config();
+	if (!is_rerere_enabled())
+		return -1;
+
+	if (flags & (RERERE_AUTOUPDATE|RERERE_NOAUTOUPDATE))
+		rerere_autoupdate = !!(flags & RERERE_AUTOUPDATE);
+	if (flags & RERERE_READONLY)
+		fd = 0;
+	else
+		fd = repo_hold_lock_file_for_update(r, &write_lock,
+						    git_path_merge_rr(r),
+						    LOCK_DIE_ON_ERROR);
+	read_rr(r, merge_rr);
+	return fd;
+}
+
+/*
+ * The main entry point that is called internally from codepaths that
+ * perform mergy operations, possibly leaving conflicted index entries
+ * and working tree files.
+ */
+int repo_rerere(struct repository *r, int flags)
+{
+	struct string_list merge_rr = STRING_LIST_INIT_DUP;
+	int fd, status;
+
+	fd = setup_rerere(r, &merge_rr, flags);
+	if (fd < 0)
+		return 0;
+	status = do_plain_rerere(r, &merge_rr, fd);
+	free_rerere_dirs();
+	string_list_clear(&merge_rr, 1);
+	return status;
+}
+
+/*
+ * Subclass of rerere_io that reads from an in-core buffer that is a
+ * strbuf
+ */
 struct rerere_io_mem {
 	struct rerere_io io;
 	struct strbuf input;
 };
 
+/*
+ * ... and its getline() method implementation
+ */
 static int rerere_mem_getline(struct strbuf *sb, struct rerere_io *io_)
 {
 	struct rerere_io_mem *io = (struct rerere_io_mem *)io_;
@@ -295,49 +943,54 @@ static int rerere_mem_getline(struct strbuf *sb, struct rerere_io *io_)
 	return 0;
 }
 
-static int handle_cache(const char *path, unsigned char *sha1, const char *output)
+static int handle_cache(struct index_state *istate,
+			const char *path, unsigned char *hash, const char *output)
 {
 	mmfile_t mmfile[3] = {{NULL}};
 	mmbuffer_t result = {NULL, 0};
 	const struct cache_entry *ce;
-	int pos, len, i, hunk_no;
+	int pos, len, i, has_conflicts;
 	struct rerere_io_mem io;
-	int marker_size = ll_merge_marker_size(path);
+	int marker_size = ll_merge_marker_size(istate, path);
 
 	/*
 	 * Reproduce the conflicted merge in-core
 	 */
 	len = strlen(path);
-	pos = cache_name_pos(path, len);
+	pos = index_name_pos(istate, path, len);
 	if (0 <= pos)
 		return -1;
 	pos = -pos - 1;
 
-	for (i = 0; i < 3; i++) {
+	while (pos < istate->cache_nr) {
 		enum object_type type;
-		unsigned long size;
-		int j;
+		size_t size;
 
-		if (active_nr <= pos)
-			break;
-		ce = active_cache[pos++];
+		ce = istate->cache[pos++];
 		if (ce_namelen(ce) != len || memcmp(ce->name, path, len))
-			continue;
-		j = ce_stage(ce) - 1;
-		mmfile[j].ptr = read_sha1_file(ce->sha1, &type, &size);
-		mmfile[j].size = size;
+			break;
+		i = ce_stage(ce) - 1;
+		if (!mmfile[i].ptr) {
+			mmfile[i].ptr = odb_read_object(the_repository->objects,
+							&ce->oid, &type, &size);
+			if (!mmfile[i].ptr)
+				die(_("unable to read %s"),
+				    oid_to_hex(&ce->oid));
+			mmfile[i].size = size;
+		}
 	}
-	for (i = 0; i < 3; i++) {
+	for (i = 0; i < 3; i++)
 		if (!mmfile[i].ptr && !mmfile[i].size)
 			mmfile[i].ptr = xstrdup("");
-	}
+
 	/*
 	 * NEEDSWORK: handle conflicts from merges with
-	 * merge.renormalize set, too
+	 * merge.renormalize set, too?
 	 */
 	ll_merge(&result, path, &mmfile[0], NULL,
 		 &mmfile[1], "ours",
-		 &mmfile[2], "theirs", NULL);
+		 &mmfile[2], "theirs",
+		 istate, NULL);
 	for (i = 0; i < 3; i++)
 		free(mmfile[i].ptr);
 
@@ -350,406 +1003,352 @@ static int handle_cache(const char *path, unsigned char *sha1, const char *outpu
 	strbuf_init(&io.input, 0);
 	strbuf_attach(&io.input, result.ptr, result.size, result.size);
 
-	hunk_no = handle_path(sha1, (struct rerere_io *)&io, marker_size);
+	/*
+	 * Grab the conflict ID and optionally write the original
+	 * contents with conflict markers out.
+	 */
+	has_conflicts = handle_path(hash, (struct rerere_io *)&io, marker_size);
 	strbuf_release(&io.input);
 	if (io.io.output)
 		fclose(io.io.output);
-	return hunk_no;
+	return has_conflicts;
 }
 
-static int check_one_conflict(int i, int *type)
+static int rerere_forget_one_path(struct index_state *istate,
+				  const char *path,
+				  struct string_list *rr)
 {
-	const struct cache_entry *e = active_cache[i];
-
-	if (!ce_stage(e)) {
-		*type = RESOLVED;
-		return i + 1;
-	}
-
-	*type = PUNTED;
-	if (ce_stage(e) == 1) {
-		if (active_nr <= ++i)
-			return i + 1;
-	}
-
-	/* Only handle regular files with both stages #2 and #3 */
-	if (i + 1 < active_nr) {
-		const struct cache_entry *e2 = active_cache[i];
-		const struct cache_entry *e3 = active_cache[i + 1];
-		if (ce_stage(e2) == 2 &&
-		    ce_stage(e3) == 3 &&
-		    ce_same_name(e, e3) &&
-		    S_ISREG(e2->ce_mode) &&
-		    S_ISREG(e3->ce_mode))
-			*type = THREE_STAGED;
-	}
-
-	/* Skip the entries with the same name */
-	while (i < active_nr && ce_same_name(e, active_cache[i]))
-		i++;
-	return i;
-}
-
-static int find_conflict(struct string_list *conflict)
-{
-	int i;
-	if (read_cache() < 0)
-		return error("Could not read index");
-
-	for (i = 0; i < active_nr;) {
-		int conflict_type;
-		const struct cache_entry *e = active_cache[i];
-		i = check_one_conflict(i, &conflict_type);
-		if (conflict_type == THREE_STAGED)
-			string_list_insert(conflict, (const char *)e->name);
-	}
-	return 0;
-}
-
-int rerere_remaining(struct string_list *merge_rr)
-{
-	int i;
-	if (setup_rerere(merge_rr, RERERE_READONLY))
-		return 0;
-	if (read_cache() < 0)
-		return error("Could not read index");
-
-	for (i = 0; i < active_nr;) {
-		int conflict_type;
-		const struct cache_entry *e = active_cache[i];
-		i = check_one_conflict(i, &conflict_type);
-		if (conflict_type == PUNTED)
-			string_list_insert(merge_rr, (const char *)e->name);
-		else if (conflict_type == RESOLVED) {
-			struct string_list_item *it;
-			it = string_list_lookup(merge_rr, (const char *)e->name);
-			if (it != NULL) {
-				free(it->util);
-				it->util = RERERE_RESOLVED;
-			}
-		}
-	}
-	return 0;
-}
-
-static int merge(const char *name, const char *path)
-{
+	const char *filename;
+	struct rerere_id *id;
+	unsigned char hash[GIT_MAX_RAWSZ];
 	int ret;
-	mmfile_t cur = {NULL, 0}, base = {NULL, 0}, other = {NULL, 0};
-	mmbuffer_t result = {NULL, 0};
+	struct strbuf buf = STRBUF_INIT;
+	struct string_list_item *item;
 
-	if (handle_file(path, NULL, rerere_path(name, "thisimage")) < 0)
-		return 1;
+	/*
+	 * Recreate the original conflict from the stages in the
+	 * index and compute the conflict ID
+	 */
+	ret = handle_cache(istate, path, hash, NULL);
+	if (ret < 1)
+		return error(_("could not parse conflict hunks in '%s'"), path);
 
-	if (read_mmfile(&cur, rerere_path(name, "thisimage")) ||
-			read_mmfile(&base, rerere_path(name, "preimage")) ||
-			read_mmfile(&other, rerere_path(name, "postimage"))) {
-		ret = 1;
-		goto out;
+	/* Nuke the recorded resolution for the conflict */
+	id = new_rerere_id(hash);
+
+	for (id->variant = 0;
+	     id->variant < id->collection->status_nr;
+	     id->variant++) {
+		mmfile_t cur = { NULL, 0 };
+		mmbuffer_t result = {NULL, 0};
+		int cleanly_resolved;
+
+		if (!has_rerere_resolution(id))
+			continue;
+
+		handle_cache(istate, path, hash, rerere_path(&buf, id, "thisimage"));
+		if (read_mmfile(&cur, rerere_path(&buf, id, "thisimage"))) {
+			free(cur.ptr);
+			error(_("failed to update conflicted state in '%s'"), path);
+			goto fail_exit;
+		}
+		cleanly_resolved = !try_merge(istate, id, path, &cur, &result);
+		free(result.ptr);
+		free(cur.ptr);
+		if (cleanly_resolved)
+			break;
 	}
-	ret = ll_merge(&result, path, &base, NULL, &cur, "", &other, "", NULL);
-	if (!ret) {
-		FILE *f;
 
-		if (utime(rerere_path(name, "postimage"), NULL) < 0)
-			warning("failed utime() on %s: %s",
-					rerere_path(name, "postimage"),
-					strerror(errno));
-		f = fopen(path, "w");
-		if (!f)
-			return error("Could not open %s: %s", path,
-				     strerror(errno));
-		if (fwrite(result.ptr, result.size, 1, f) != 1)
-			error("Could not write %s: %s", path, strerror(errno));
-		if (fclose(f))
-			return error("Writing %s failed: %s", path,
-				     strerror(errno));
+	if (id->collection->status_nr <= id->variant) {
+		error(_("no remembered resolution for '%s'"), path);
+		goto fail_exit;
 	}
 
-out:
-	free(cur.ptr);
-	free(base.ptr);
-	free(other.ptr);
-	free(result.ptr);
+	filename = rerere_path(&buf, id, "postimage");
+	if (unlink(filename)) {
+		if (errno == ENOENT)
+			error(_("no remembered resolution for '%s'"), path);
+		else
+			error_errno(_("cannot unlink '%s'"), filename);
+		goto fail_exit;
+	}
 
+	/*
+	 * Update the preimage so that the user can resolve the
+	 * conflict in the working tree, run us again to record
+	 * the postimage.
+	 */
+	handle_cache(istate, path, hash, rerere_path(&buf, id, "preimage"));
+	fprintf_ln(stderr, _("Updated preimage for '%s'"), path);
+
+	/*
+	 * And remember that we can record resolution for this
+	 * conflict when the user is done.
+	 */
+	item = string_list_insert(rr, path);
+	free_rerere_id(item);
+	item->util = id;
+	fprintf(stderr, _("Forgot resolution for '%s'\n"), path);
+	strbuf_release(&buf);
+	return 0;
+
+fail_exit:
+	strbuf_release(&buf);
+	free(id);
+	return -1;
+}
+
+int rerere_forget(struct repository *r, struct pathspec *pathspec)
+{
+	int i, fd, ret;
+	struct string_list conflict = STRING_LIST_INIT_DUP;
+	struct string_list merge_rr = STRING_LIST_INIT_DUP;
+
+	if (repo_read_index(r) < 0)
+		return error(_("index file corrupt"));
+
+	fd = setup_rerere(r, &merge_rr, RERERE_NOAUTOUPDATE);
+	if (fd < 0)
+		return 0;
+
+	/*
+	 * The paths may have been resolved (incorrectly);
+	 * recover the original conflicted state and then
+	 * find the conflicted paths.
+	 */
+	unmerge_index(r->index, pathspec, 0);
+	find_conflict(r, &conflict);
+	for (i = 0; i < conflict.nr; i++) {
+		struct string_list_item *it = &conflict.items[i];
+		if (!match_pathspec(r->index, pathspec, it->string,
+				    strlen(it->string), 0, NULL, 0))
+			continue;
+		rerere_forget_one_path(r->index, it->string, &merge_rr);
+	}
+
+	ret = write_rr(&merge_rr, fd);
+
+	string_list_clear(&conflict, 0);
+	string_list_clear(&merge_rr, 1);
 	return ret;
 }
 
-static struct lock_file index_lock;
+/*
+ * Garbage collection support
+ */
 
-static void update_paths(struct string_list *update)
+static timestamp_t rerere_created_at(struct rerere_id *id)
 {
-	int i;
+	struct strbuf buf = STRBUF_INIT;
+	struct stat st;
+	timestamp_t ret;
 
-	hold_locked_index(&index_lock, 1);
+	ret = stat(rerere_path(&buf, id, "preimage"), &st) ? (time_t) 0 : st.st_mtime;
 
-	for (i = 0; i < update->nr; i++) {
-		struct string_list_item *item = &update->items[i];
-		if (add_file_to_cache(item->string, 0))
-			exit(128);
-	}
-
-	if (active_cache_changed) {
-		if (write_locked_index(&the_index, &index_lock, COMMIT_LOCK))
-			die("Unable to write new index file");
-	} else
-		rollback_lock_file(&index_lock);
+	strbuf_release(&buf);
+	return ret;
 }
 
-static int do_plain_rerere(struct string_list *rr, int fd)
+static timestamp_t rerere_last_used_at(struct rerere_id *id)
 {
-	struct string_list conflict = STRING_LIST_INIT_DUP;
-	struct string_list update = STRING_LIST_INIT_DUP;
-	int i;
+	struct strbuf buf = STRBUF_INIT;
+	struct stat st;
+	timestamp_t ret;
 
-	find_conflict(&conflict);
+	ret = stat(rerere_path(&buf, id, "postimage"), &st) ? (time_t) 0 : st.st_mtime;
 
-	/*
-	 * MERGE_RR records paths with conflicts immediately after merge
-	 * failed.  Some of the conflicted paths might have been hand resolved
-	 * in the working tree since then, but the initial run would catch all
-	 * and register their preimages.
-	 */
+	strbuf_release(&buf);
+	return ret;
+}
 
-	for (i = 0; i < conflict.nr; i++) {
-		const char *path = conflict.items[i].string;
-		if (!string_list_has_string(rr, path)) {
-			unsigned char sha1[20];
-			char *hex;
-			int ret;
-			ret = handle_file(path, sha1, NULL);
-			if (ret < 1)
-				continue;
-			hex = xstrdup(sha1_to_hex(sha1));
-			string_list_insert(rr, path)->util = hex;
-			if (mkdir_in_gitdir(git_path("rr-cache/%s", hex)))
-				continue;
-			handle_file(path, NULL, rerere_path(hex, "preimage"));
-			fprintf(stderr, "Recorded preimage for '%s'\n", path);
-		}
+/*
+ * Remove the recorded resolution for a given conflict ID
+ */
+static void unlink_rr_item(struct rerere_id *id)
+{
+	struct strbuf buf = STRBUF_INIT;
+	unlink_or_warn(rerere_path(&buf, id, "thisimage"));
+	remove_variant(id);
+	id->collection->status[id->variant] = 0;
+	strbuf_release(&buf);
+}
+
+static void rerere_gc_cutoffs(struct repository *r,
+			      timestamp_t *cutoff_resolve,
+			      timestamp_t *cutoff_noresolve)
+{
+	timestamp_t now = time(NULL);
+
+	if (repo_config_get_expiry_in_days(r, "gc.rerereresolved",
+					   cutoff_resolve, now))
+		*cutoff_resolve = now - 60 * 86400;
+	if (repo_config_get_expiry_in_days(r, "gc.rerereunresolved",
+					   cutoff_noresolve, now))
+		*cutoff_noresolve = now - 15 * 86400;
+}
+
+static bool rerere_id_is_stale(struct rerere_id *id,
+			       timestamp_t cutoff_resolve,
+			       timestamp_t cutoff_noresolve)
+{
+	timestamp_t then;
+	timestamp_t cutoff;
+
+	then = rerere_last_used_at(id);
+	if (then) {
+		cutoff = cutoff_resolve;
+	} else {
+		then = rerere_created_at(id);
+		if (!then)
+			return false;
+		cutoff = cutoff_noresolve;
 	}
 
-	/*
-	 * Now some of the paths that had conflicts earlier might have been
-	 * hand resolved.  Others may be similar to a conflict already that
-	 * was resolved before.
-	 */
+	return then < cutoff;
+}
 
-	for (i = 0; i < rr->nr; i++) {
-		int ret;
-		const char *path = rr->items[i].string;
-		const char *name = (const char *)rr->items[i].util;
+static void prune_one(struct rerere_id *id,
+		      timestamp_t cutoff_resolve, timestamp_t cutoff_noresolve)
+{
+	if (rerere_id_is_stale(id, cutoff_resolve, cutoff_noresolve))
+		unlink_rr_item(id);
+}
 
-		if (has_rerere_resolution(name)) {
-			if (!merge(name, path)) {
-				const char *msg;
-				if (rerere_autoupdate) {
-					string_list_insert(&update, path);
-					msg = "Staged '%s' using previous resolution.\n";
-				} else
-					msg = "Resolved '%s' using previous resolution.\n";
-				fprintf(stderr, msg, path);
-				goto mark_resolved;
+/* Does the basename in "path" look plausibly like an rr-cache entry? */
+static int is_rr_cache_dirname(const char *path)
+{
+	struct object_id oid;
+	const char *end;
+	return !parse_oid_hex(path, &oid, &end) && !*end;
+}
+
+bool rerere_gc_needed(struct repository *r, size_t limit)
+{
+	timestamp_t cutoff_resolve, cutoff_noresolve;
+	struct strbuf buf = STRBUF_INIT;
+	bool needed = false;
+	struct dirent *e;
+	size_t count = 0;
+	DIR *dir;
+
+	dir = opendir(repo_git_path_replace(r, &buf, "rr-cache"));
+	if (!dir)
+		goto out;
+
+	rerere_gc_cutoffs(r, &cutoff_resolve, &cutoff_noresolve);
+
+	while ((e = readdir_skip_dot_and_dotdot(dir))) {
+		struct rerere_id id;
+
+		/*
+		 * We estimate the number of stale entries by only considering
+		 * those starting with "17". This is the same strategy that we
+		 * use for estimating the number of loose objects.
+		 */
+		if (!starts_with(e->d_name, "17") ||
+		    !is_rr_cache_dirname(e->d_name))
+			continue;
+
+		id.collection = find_rerere_dir(e->d_name);
+		for (id.variant = 0;
+		     id.variant < id.collection->status_nr;
+		     id.variant++) {
+			if (rerere_id_is_stale(&id, cutoff_resolve,
+					       cutoff_noresolve)) {
+				count += 256;
+				if (count >= limit) {
+					needed = true;
+					goto out;
+				}
 			}
 		}
-
-		/* Let's see if we have resolved it. */
-		ret = handle_file(path, NULL, NULL);
-		if (ret)
-			continue;
-
-		fprintf(stderr, "Recorded resolution for '%s'.\n", path);
-		copy_file(rerere_path(name, "postimage"), path, 0666);
-	mark_resolved:
-		rr->items[i].util = NULL;
 	}
 
-	if (update.nr)
-		update_paths(&update);
-
-	return write_rr(rr, fd);
+out:
+	if (dir)
+		closedir(dir);
+	free_rerere_dirs();
+	strbuf_release(&buf);
+	return needed;
 }
 
-static void git_rerere_config(void)
-{
-	git_config_get_bool("rerere.enabled", &rerere_enabled);
-	git_config_get_bool("rerere.autoupdate", &rerere_autoupdate);
-	git_config(git_default_config, NULL);
-}
-
-static GIT_PATH_FUNC(git_path_rr_cache, "rr-cache")
-
-static int is_rerere_enabled(void)
-{
-	int rr_cache_exists;
-
-	if (!rerere_enabled)
-		return 0;
-
-	rr_cache_exists = is_directory(git_path_rr_cache());
-	if (rerere_enabled < 0)
-		return rr_cache_exists;
-
-	if (!rr_cache_exists && mkdir_in_gitdir(git_path_rr_cache()))
-		die("Could not create directory %s", git_path_rr_cache());
-	return 1;
-}
-
-int setup_rerere(struct string_list *merge_rr, int flags)
-{
-	int fd;
-
-	git_rerere_config();
-	if (!is_rerere_enabled())
-		return -1;
-
-	if (flags & (RERERE_AUTOUPDATE|RERERE_NOAUTOUPDATE))
-		rerere_autoupdate = !!(flags & RERERE_AUTOUPDATE);
-	if (flags & RERERE_READONLY)
-		fd = 0;
-	else
-		fd = hold_lock_file_for_update(&write_lock, git_path_merge_rr(),
-					       LOCK_DIE_ON_ERROR);
-	read_rr(merge_rr);
-	return fd;
-}
-
-int rerere(int flags)
-{
-	struct string_list merge_rr = STRING_LIST_INIT_DUP;
-	int fd;
-
-	fd = setup_rerere(&merge_rr, flags);
-	if (fd < 0)
-		return 0;
-	return do_plain_rerere(&merge_rr, fd);
-}
-
-static int rerere_forget_one_path(const char *path, struct string_list *rr)
-{
-	const char *filename;
-	char *hex;
-	unsigned char sha1[20];
-	int ret;
-
-	ret = handle_cache(path, sha1, NULL);
-	if (ret < 1)
-		return error("Could not parse conflict hunks in '%s'", path);
-	hex = xstrdup(sha1_to_hex(sha1));
-	filename = rerere_path(hex, "postimage");
-	if (unlink(filename))
-		return (errno == ENOENT
-			? error("no remembered resolution for %s", path)
-			: error("cannot unlink %s: %s", filename, strerror(errno)));
-
-	handle_cache(path, sha1, rerere_path(hex, "preimage"));
-	fprintf(stderr, "Updated preimage for '%s'\n", path);
-
-
-	string_list_insert(rr, path)->util = hex;
-	fprintf(stderr, "Forgot resolution for %s\n", path);
-	return 0;
-}
-
-int rerere_forget(struct pathspec *pathspec)
-{
-	int i, fd;
-	struct string_list conflict = STRING_LIST_INIT_DUP;
-	struct string_list merge_rr = STRING_LIST_INIT_DUP;
-
-	if (read_cache() < 0)
-		return error("Could not read index");
-
-	fd = setup_rerere(&merge_rr, RERERE_NOAUTOUPDATE);
-	if (fd < 0)
-		return 0;
-
-	unmerge_cache(pathspec);
-	find_conflict(&conflict);
-	for (i = 0; i < conflict.nr; i++) {
-		struct string_list_item *it = &conflict.items[i];
-		if (!match_pathspec(pathspec, it->string,
-				    strlen(it->string), 0, NULL, 0))
-			continue;
-		rerere_forget_one_path(it->string, &merge_rr);
-	}
-	return write_rr(&merge_rr, fd);
-}
-
-static time_t rerere_created_at(const char *name)
-{
-	struct stat st;
-	return stat(rerere_path(name, "preimage"), &st) ? (time_t) 0 : st.st_mtime;
-}
-
-static time_t rerere_last_used_at(const char *name)
-{
-	struct stat st;
-	return stat(rerere_path(name, "postimage"), &st) ? (time_t) 0 : st.st_mtime;
-}
-
-static void unlink_rr_item(const char *name)
-{
-	unlink(rerere_path(name, "thisimage"));
-	unlink(rerere_path(name, "preimage"));
-	unlink(rerere_path(name, "postimage"));
-	rmdir(git_path("rr-cache/%s", name));
-}
-
-void rerere_gc(struct string_list *rr)
+void rerere_gc(struct repository *r, struct string_list *rr)
 {
 	struct string_list to_remove = STRING_LIST_INIT_DUP;
 	DIR *dir;
 	struct dirent *e;
-	int i, cutoff;
-	time_t now = time(NULL), then;
-	int cutoff_noresolve = 15;
-	int cutoff_resolve = 60;
+	int i;
+	timestamp_t cutoff_noresolve;
+	timestamp_t cutoff_resolve;
+	struct strbuf buf = STRBUF_INIT;
 
-	if (setup_rerere(rr, 0) < 0)
+	if (setup_rerere(r, rr, 0) < 0)
 		return;
 
-	git_config_get_int("gc.rerereresolved", &cutoff_resolve);
-	git_config_get_int("gc.rerereunresolved", &cutoff_noresolve);
-	git_config(git_default_config, NULL);
-	dir = opendir(git_path("rr-cache"));
+	rerere_gc_cutoffs(r, &cutoff_resolve, &cutoff_noresolve);
+	repo_config(the_repository, git_default_config, NULL);
+	dir = opendir(repo_git_path_replace(the_repository, &buf, "rr-cache"));
 	if (!dir)
-		die_errno("unable to open rr-cache directory");
-	while ((e = readdir(dir))) {
-		if (is_dot_or_dotdot(e->d_name))
-			continue;
+		die_errno(_("unable to open rr-cache directory"));
+	/* Collect stale conflict IDs ... */
+	while ((e = readdir_skip_dot_and_dotdot(dir))) {
+		struct rerere_dir *rr_dir;
+		struct rerere_id id;
+		int now_empty;
 
-		then = rerere_last_used_at(e->d_name);
-		if (then) {
-			cutoff = cutoff_resolve;
-		} else {
-			then = rerere_created_at(e->d_name);
-			if (!then)
-				continue;
-			cutoff = cutoff_noresolve;
+		if (!is_rr_cache_dirname(e->d_name))
+			continue; /* or should we remove e->d_name? */
+
+		rr_dir = find_rerere_dir(e->d_name);
+
+		now_empty = 1;
+		for (id.variant = 0, id.collection = rr_dir;
+		     id.variant < id.collection->status_nr;
+		     id.variant++) {
+			prune_one(&id, cutoff_resolve, cutoff_noresolve);
+			if (id.collection->status[id.variant])
+				now_empty = 0;
 		}
-		if (then < now - cutoff * 86400)
+		if (now_empty)
 			string_list_append(&to_remove, e->d_name);
 	}
 	closedir(dir);
+
+	/* ... and then remove the empty directories */
 	for (i = 0; i < to_remove.nr; i++)
-		unlink_rr_item(to_remove.items[i].string);
+		rmdir(repo_git_path_replace(the_repository, &buf,
+					    "rr-cache/%s", to_remove.items[i].string));
+
 	string_list_clear(&to_remove, 0);
 	rollback_lock_file(&write_lock);
+	strbuf_release(&buf);
 }
 
-void rerere_clear(struct string_list *merge_rr)
+/*
+ * During a conflict resolution, after "rerere" recorded the
+ * preimages, abandon them if the user did not resolve them or
+ * record their resolutions.  And drop $GIT_DIR/MERGE_RR.
+ *
+ * NEEDSWORK: shouldn't we be calling this from "reset --hard"?
+ */
+void rerere_clear(struct repository *r, struct string_list *merge_rr)
 {
 	int i;
 
-	if (setup_rerere(merge_rr, 0) < 0)
+	if (setup_rerere(r, merge_rr, 0) < 0)
 		return;
 
 	for (i = 0; i < merge_rr->nr; i++) {
-		const char *name = (const char *)merge_rr->items[i].util;
-		if (!has_rerere_resolution(name))
-			unlink_rr_item(name);
+		struct rerere_id *id = merge_rr->items[i].util;
+		struct strbuf buf = STRBUF_INIT;
+
+		if (!has_rerere_resolution(id)) {
+			unlink_rr_item(id);
+			rmdir(rerere_path(&buf, id, NULL));
+		}
+
+		strbuf_release(&buf);
 	}
-	unlink_or_warn(git_path_merge_rr());
+	unlink_or_warn(git_path_merge_rr(r));
 	rollback_lock_file(&write_lock);
 }

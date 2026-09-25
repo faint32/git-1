@@ -1,6 +1,9 @@
 #include "builtin.h"
 #include "transport.h"
 
+static const char usage_msg[] =
+	"git remote-fd <remote> <url>";
+
 /*
  * URL syntax:
  *	'fd::<inoutfd>[/<anything>]'		Read/write socket pair
@@ -37,7 +40,7 @@ static void command_loop(int input_fd, int output_fd)
 		if (!strcmp(buffer, "capabilities")) {
 			printf("*connect\n\n");
 			fflush(stdout);
-		} else if (!strncmp(buffer, "connect ", 8)) {
+		} else if (starts_with(buffer, "connect ")) {
 			printf("\n");
 			fflush(stdout);
 			if (bidirectional_transfer_loop(input_fd,
@@ -50,14 +53,20 @@ static void command_loop(int input_fd, int output_fd)
 	}
 }
 
-int cmd_remote_fd(int argc, const char **argv, const char *prefix)
+int cmd_remote_fd(int argc,
+		  const char **argv,
+		  const char *prefix,
+		  struct repository *repo UNUSED)
 {
 	int input_fd = -1;
 	int output_fd = -1;
 	char *end;
 
+	BUG_ON_NON_EMPTY_PREFIX(prefix);
+
+	show_usage_if_asked(argc, argv, usage_msg);
 	if (argc != 3)
-		die("Expected two arguments");
+		usage(usage_msg);
 
 	input_fd = (int)strtoul(argv[2], &end, 10);
 

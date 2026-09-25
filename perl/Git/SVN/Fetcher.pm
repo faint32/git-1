@@ -3,13 +3,14 @@ use vars qw/@ISA $_ignore_regex $_include_regex $_preserve_empty_dirs
             $_placeholder_filename @deleted_gpath %added_placeholder
             $repo_id/;
 use strict;
-use warnings;
+use warnings $ENV{GIT_PERL_FATAL_WARNINGS} ? qw(FATAL all) : ();
 use SVN::Delta;
 use Carp qw/croak/;
 use File::Basename qw/dirname/;
 use Git qw/command command_oneline command_noisy command_output_pipe
            command_input_pipe command_close_pipe
-           command_bidi_pipe command_close_bidi_pipe/;
+           command_bidi_pipe command_close_bidi_pipe
+           get_record/;
 BEGIN {
 	@ISA = qw(SVN::Delta::Editor);
 }
@@ -86,11 +87,9 @@ sub _mark_empty_symlinks {
 	my $printed_warning;
 	chomp(my $empty_blob = `git hash-object -t blob --stdin < /dev/null`);
 	my ($ls, $ctx) = command_output_pipe(qw/ls-tree -r -z/, $cmt);
-	local $/ = "\0";
 	my $pfx = defined($switch_path) ? $switch_path : $git_svn->path;
 	$pfx .= '/' if length($pfx);
-	while (<$ls>) {
-		chomp;
+	while (defined($_ = get_record($ls, "\0"))) {
 		s/\A100644 blob $empty_blob\t//o or next;
 		unless ($printed_warning) {
 			print STDERR "Scanning for empty symlinks, ",
@@ -174,14 +173,12 @@ sub delete_entry {
 
 	# remove entire directories.
 	my ($tree) = (command('ls-tree', '-z', $self->{c}, "./$gpath")
-	                 =~ /\A040000 tree ([a-f\d]{40})\t\Q$gpath\E\0/);
+	                 =~ /\A040000 tree ($::oid)\t\Q$gpath\E\0/);
 	if ($tree) {
 		my ($ls, $ctx) = command_output_pipe(qw/ls-tree
 		                                     -r --name-only -z/,
 				                     $tree);
-		local $/ = "\0";
-		while (<$ls>) {
-			chomp;
+		while (defined($_ = get_record($ls, "\0"))) {
 			my $rmpath = "$gpath/$_";
 			$self->{gii}->remove($rmpath);
 			print "\tD\t$rmpath\n" unless $::_q;
@@ -206,7 +203,7 @@ sub open_file {
 
 	my $gpath = $self->git_path($path);
 	($mode, $blob) = (command('ls-tree', '-z', $self->{c}, "./$gpath")
-	                     =~ /\A(\d{6}) blob ([a-f\d]{40})\t\Q$gpath\E\0/);
+	                     =~ /\A(\d{6}) blob ($::oid)\t\Q$gpath\E\0/);
 	unless (defined $mode && defined $blob) {
 		die "$path was not found in commit $self->{c} (r$rev)\n";
 	}
@@ -247,9 +244,7 @@ sub add_directory {
 		my ($ls, $ctx) = command_output_pipe(qw/ls-tree
 		                                     -r --name-only -z/,
 				                     $self->{c});
-		local $/ = "\0";
-		while (<$ls>) {
-			chomp;
+		while (defined($_ = get_record($ls, "\0"))) {
 			$self->{gii}->remove($_);
 			print "\tD\t$_\n" unless $::_q;
 			push @deleted_gpath, $gpath;
@@ -418,7 +413,7 @@ sub close_file {
 
 		$hash = $::_repository->hash_and_insert_object(
 				Git::temp_path($fh));
-		$hash =~ /^[a-f\d]{40}$/ or die "not a sha1: $hash\n";
+		$hash =~ /^$::oid$/ or die "not an object ID: $hash\n";
 
 		Git::temp_release($fb->{base}, 1);
 		Git::temp_release($fh, 1);

@@ -1,19 +1,92 @@
-#include "cache.h"
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
+#include "environment.h"
 #include "tag.h"
+#include "object-name.h"
+#include "odb.h"
 #include "commit.h"
 #include "tree.h"
 #include "blob.h"
+#include "alloc.h"
+#include "gpg-interface.h"
+#include "hex.h"
+#include "packfile.h"
+#include "repository.h"
 
 const char *tag_type = "tag";
 
-struct object *deref_tag(struct object *o, const char *warn, int warnlen)
+static int run_gpg_verify(const char *buf, unsigned long size, unsigned flags)
 {
+	struct signature_check sigc;
+	struct strbuf payload = STRBUF_INIT;
+	struct strbuf signature = STRBUF_INIT;
+	int ret;
+
+	memset(&sigc, 0, sizeof(sigc));
+
+	if (!parse_signature(buf, size, &payload, &signature)) {
+		if (flags & GPG_VERIFY_VERBOSE)
+			write_in_full(1, buf, size);
+		return error("no signature found");
+	}
+
+	sigc.payload_type = SIGNATURE_PAYLOAD_TAG;
+	sigc.payload = strbuf_detach(&payload, &sigc.payload_len);
+	ret = check_signature(&sigc, signature.buf, signature.len);
+
+	if (!(flags & GPG_VERIFY_OMIT_STATUS))
+		print_signature_buffer(&sigc, flags);
+
+	signature_check_clear(&sigc);
+	strbuf_release(&payload);
+	strbuf_release(&signature);
+	return ret;
+}
+
+int gpg_verify_tag(struct repository *r, const struct object_id *oid,
+		   const char *name_to_report, unsigned flags)
+{
+	enum object_type type;
+	char *buf;
+	size_t size;
+	int ret;
+
+	type = odb_read_object_info(r->objects, oid, NULL);
+	if (type != OBJ_TAG)
+		return error("%s: cannot verify a non-tag object of type %s.",
+				name_to_report ?
+				name_to_report :
+				oid_to_hex(oid),
+				type_name(type));
+
+	buf = odb_read_object(r->objects, oid, &type, &size);
+	if (!buf)
+		return error("%s: unable to read file.",
+				name_to_report ?
+				name_to_report :
+				oid_to_hex(oid));
+
+	ret = run_gpg_verify(buf, size, flags);
+
+	free(buf);
+	return ret;
+}
+
+struct object *deref_tag(struct repository *r, struct object *o, const char *warn, int warnlen)
+{
+	struct object_id *last_oid = NULL;
 	while (o && o->type == OBJ_TAG)
-		if (((struct tag *)o)->tagged)
-			o = parse_object(((struct tag *)o)->tagged->sha1);
-		else
+		if (((struct tag *)o)->tagged) {
+			last_oid = &((struct tag *)o)->tagged->oid;
+			o = parse_object(r, last_oid);
+		} else {
+			last_oid = NULL;
 			o = NULL;
+		}
 	if (!o && warn) {
+		if (last_oid && is_promisor_object(r, last_oid))
+			return NULL;
 		if (!warnlen)
 			warnlen = strlen(warn);
 		error("missing object referenced by '%.*s'", warnlen, warn);
@@ -21,27 +94,15 @@ struct object *deref_tag(struct object *o, const char *warn, int warnlen)
 	return o;
 }
 
-struct object *deref_tag_noverify(struct object *o)
+struct tag *lookup_tag(struct repository *r, const struct object_id *oid)
 {
-	while (o && o->type == OBJ_TAG) {
-		o = parse_object(o->sha1);
-		if (o && o->type == OBJ_TAG && ((struct tag *)o)->tagged)
-			o = ((struct tag *)o)->tagged;
-		else
-			o = NULL;
-	}
-	return o;
-}
-
-struct tag *lookup_tag(const unsigned char *sha1)
-{
-	struct object *obj = lookup_object(sha1);
+	struct object *obj = lookup_object(r, oid);
 	if (!obj)
-		return create_object(sha1, alloc_tag_node());
+		return create_object(r, oid, alloc_tag_node(r));
 	return object_as_type(obj, OBJ_TAG, 0);
 }
 
-static unsigned long parse_tag_date(const char *buf, const char *tail)
+static timestamp_t parse_tag_date(const char *buf, const char *tail)
 {
 	const char *dateptr;
 
@@ -54,13 +115,21 @@ static unsigned long parse_tag_date(const char *buf, const char *tail)
 		/* nada */;
 	if (buf >= tail)
 		return 0;
-	/* dateptr < buf && buf[-1] == '\n', so strtoul will stop at buf-1 */
-	return strtoul(dateptr, NULL, 10);
+	/* dateptr < buf && buf[-1] == '\n', so parsing will stop at buf-1 */
+	return parse_timestamp(dateptr, NULL, 10);
 }
 
-int parse_tag_buffer(struct tag *item, const void *data, unsigned long size)
+void release_tag_memory(struct tag *t)
 {
-	unsigned char sha1[20];
+	free(t->tag);
+	t->tagged = NULL;
+	t->object.parsed = 0;
+	t->date = 0;
+}
+
+int parse_tag_buffer(struct repository *r, struct tag *item, const void *data, unsigned long size)
+{
+	struct object_id oid;
 	char type[20];
 	const char *bufptr = data;
 	const char *tail = bufptr + size;
@@ -68,13 +137,23 @@ int parse_tag_buffer(struct tag *item, const void *data, unsigned long size)
 
 	if (item->object.parsed)
 		return 0;
-	item->object.parsed = 1;
 
-	if (size < 64)
+	if (item->tag) {
+		/*
+		 * Presumably left over from a previous failed parse;
+		 * clear it out in preparation for re-parsing (we'll probably
+		 * hit the same error, which lets us tell our current caller
+		 * about the problem).
+		 */
+		FREE_AND_NULL(item->tag);
+	}
+
+	if (size < r->hash_algo->hexsz + 24)
 		return -1;
-	if (memcmp("object ", bufptr, 7) || get_sha1_hex(bufptr + 7, sha1) || bufptr[47] != '\n')
+	if (memcmp("object ", bufptr, 7) ||
+	    parse_oid_hex_algop(bufptr + 7, &oid, &bufptr, r->hash_algo) ||
+	    *bufptr++ != '\n')
 		return -1;
-	bufptr += 48; /* "object " + sha1 + "\n" */
 
 	if (!starts_with(bufptr, "type "))
 		return -1;
@@ -82,22 +161,27 @@ int parse_tag_buffer(struct tag *item, const void *data, unsigned long size)
 	nl = memchr(bufptr, '\n', tail - bufptr);
 	if (!nl || sizeof(type) <= (nl - bufptr))
 		return -1;
-	strncpy(type, bufptr, nl - bufptr);
+	memcpy(type, bufptr, nl - bufptr);
 	type[nl - bufptr] = '\0';
 	bufptr = nl + 1;
 
 	if (!strcmp(type, blob_type)) {
-		item->tagged = &lookup_blob(sha1)->object;
+		item->tagged = (struct object *)lookup_blob(r, &oid);
 	} else if (!strcmp(type, tree_type)) {
-		item->tagged = &lookup_tree(sha1)->object;
+		item->tagged = (struct object *)lookup_tree(r, &oid);
 	} else if (!strcmp(type, commit_type)) {
-		item->tagged = &lookup_commit(sha1)->object;
+		item->tagged = (struct object *)lookup_commit(r, &oid);
 	} else if (!strcmp(type, tag_type)) {
-		item->tagged = &lookup_tag(sha1)->object;
+		item->tagged = (struct object *)lookup_tag(r, &oid);
 	} else {
-		error("Unknown type %s", type);
-		item->tagged = NULL;
+		return error("unknown tag type '%s' in %s",
+			     type, oid_to_hex(&item->object.oid));
 	}
+
+	if (!item->tagged)
+		return error("bad tag pointer to %s in %s",
+			     oid_to_hex(&oid),
+			     oid_to_hex(&item->object.oid));
 
 	if (bufptr + 4 < tail && starts_with(bufptr, "tag "))
 		; 		/* good */
@@ -115,28 +199,36 @@ int parse_tag_buffer(struct tag *item, const void *data, unsigned long size)
 	else
 		item->date = 0;
 
+	item->object.parsed = 1;
 	return 0;
 }
 
-int parse_tag(struct tag *item)
+int parse_tag(struct repository *r, struct tag *item)
 {
 	enum object_type type;
 	void *data;
-	unsigned long size;
+	size_t size;
 	int ret;
 
 	if (item->object.parsed)
 		return 0;
-	data = read_sha1_file(item->object.sha1, &type, &size);
+	data = odb_read_object(r->objects, &item->object.oid, &type, &size);
 	if (!data)
 		return error("Could not read %s",
-			     sha1_to_hex(item->object.sha1));
+			     oid_to_hex(&item->object.oid));
 	if (type != OBJ_TAG) {
 		free(data);
 		return error("Object %s not a tag",
-			     sha1_to_hex(item->object.sha1));
+			     oid_to_hex(&item->object.oid));
 	}
-	ret = parse_tag_buffer(item, data, size);
+	ret = parse_tag_buffer(r, item, data, size);
 	free(data);
 	return ret;
+}
+
+struct object_id *get_tagged_oid(struct tag *tag)
+{
+	if (!tag->tagged)
+		die("bad tag");
+	return &tag->tagged->oid;
 }

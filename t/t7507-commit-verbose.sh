@@ -1,13 +1,13 @@
 #!/bin/sh
 
 test_description='verbose commit template'
+
 . ./test-lib.sh
 
-cat >check-for-diff <<EOF
-#!$SHELL_PATH
-exec grep '^diff --git' "\$1"
+write_script "check-for-diff" <<\EOF &&
+grep '^diff --git' "$1" >out
+exit 0
 EOF
-chmod +x check-for-diff
 test_set_editor "$PWD/check-for-diff"
 
 cat >message <<'EOF'
@@ -23,7 +23,8 @@ test_expect_success 'setup' '
 '
 
 test_expect_success 'initial commit shows verbose diff' '
-	git commit --amend -v
+	git commit --amend -v &&
+	test_line_count = 1 out
 '
 
 test_expect_success 'second commit' '
@@ -39,13 +40,15 @@ check_message() {
 
 test_expect_success 'verbose diff is stripped out' '
 	git commit --amend -v &&
-	check_message message
+	check_message message &&
+	test_line_count = 1 out
 '
 
 test_expect_success 'verbose diff is stripped out (mnemonicprefix)' '
 	git config diff.mnemonicprefix true &&
 	git commit --amend -v &&
-	check_message message
+	check_message message &&
+	test_line_count = 1 out
 '
 
 cat >diff <<'EOF'
@@ -72,6 +75,7 @@ test_expect_success 'diff in message is retained with -v' '
 
 test_expect_success 'submodule log is stripped out too with -v' '
 	git config diff.submodule log &&
+	test_config_global protocol.file.allow always &&
 	git submodule add ./. sub &&
 	git commit -m "sub added" &&
 	(
@@ -84,7 +88,7 @@ test_expect_success 'submodule log is stripped out too with -v' '
 		export GIT_EDITOR &&
 		test_must_fail git commit -a -v 2>err
 	) &&
-	test_i18ngrep "Aborting commit due to empty commit message." err
+	test_grep "Aborting commit due to empty commit message." err
 '
 
 test_expect_success 'verbose diff is stripped out with set core.commentChar' '
@@ -93,7 +97,73 @@ test_expect_success 'verbose diff is stripped out with set core.commentChar' '
 		export GIT_EDITOR &&
 		test_must_fail git -c core.commentchar=";" commit -a -v 2>err
 	) &&
-	test_i18ngrep "Aborting commit due to empty commit message." err
+	test_grep "Aborting commit due to empty commit message." err
+'
+
+test_expect_success 'verbose diff is stripped with multi-byte comment char' '
+	(
+		GIT_EDITOR=cat &&
+		export GIT_EDITOR &&
+		test_must_fail git -c core.commentchar="foo>" commit -a -v >out 2>err
+	) &&
+	test_grep "^foo> " out &&
+	test_grep "Aborting commit due to empty commit message." err
+'
+
+test_expect_success 'status does not verbose without --verbose' '
+	git status >actual &&
+	test_grep ! "^diff --git" actual
+'
+
+test_expect_success 'setup -v -v' '
+	echo dirty >file
+'
+
+for i in true 1
+do
+	test_expect_success "commit.verbose=$i and --verbose omitted" "
+		git -c commit.verbose=$i commit --amend &&
+		test_line_count = 1 out
+	"
+done
+
+for i in false -2 -1 0
+do
+	test_expect_success "commit.verbose=$i and --verbose omitted" "
+		git -c commit.verbose=$i commit --amend &&
+		test_line_count = 0 out
+	"
+done
+
+for i in 2 3
+do
+	test_expect_success "commit.verbose=$i and --verbose omitted" "
+		git -c commit.verbose=$i commit --amend &&
+		test_line_count = 2 out
+	"
+done
+
+for i in true false -2 -1 0 1 2 3
+do
+	test_expect_success "commit.verbose=$i and --verbose" "
+		git -c commit.verbose=$i commit --amend --verbose &&
+		test_line_count = 1 out
+	"
+
+	test_expect_success "commit.verbose=$i and --no-verbose" "
+		git -c commit.verbose=$i commit --amend --no-verbose &&
+		test_line_count = 0 out
+	"
+
+	test_expect_success "commit.verbose=$i and -v -v" "
+		git -c commit.verbose=$i commit --amend -v -v &&
+		test_line_count = 2 out
+	"
+done
+
+test_expect_success "status ignores commit.verbose=true" '
+	git -c commit.verbose=true status >actual &&
+	test_grep ! "^diff --git" actual
 '
 
 test_done

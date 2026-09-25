@@ -9,34 +9,34 @@ field w_check         ; # revision picker for merge test
 field w_delete        ; # delete button
 
 constructor dialog {} {
-	global current_branch use_ttk NS
+	global current_branch
 
 	make_dialog top w
 	wm withdraw $w
-	wm title $top [append "[appname] ([reponame]): " [mc "Delete Branch"]]
+	wm title $top [mc "%s (%s): Delete Branch" [appname] [reponame]]
 	if {$top ne {.}} {
 		wm geometry $top "+[winfo rootx .]+[winfo rooty .]"
 	}
 
-	${NS}::label $w.header -text [mc "Delete Local Branch"] \
+	ttk::label $w.header -text [mc "Delete Local Branch"] \
 		-font font_uibold -anchor center
 	pack $w.header -side top -fill x
 
-	${NS}::frame $w.buttons
+	ttk::frame $w.buttons
 	set w_delete $w.buttons.delete
-	${NS}::button $w_delete \
+	ttk::button $w_delete \
 		-text [mc Delete] \
 		-default active \
 		-state disabled \
 		-command [cb _delete]
 	pack $w_delete -side right
-	${NS}::button $w.buttons.cancel \
+	ttk::button $w.buttons.cancel \
 		-text [mc Cancel] \
 		-command [list destroy $w]
 	pack $w.buttons.cancel -side right -padx 5
 	pack $w.buttons -side bottom -fill x -pady 10 -padx 10
 
-	${NS}::labelframe $w.list -text [mc "Local Branches"]
+	ttk::labelframe $w.list -text [mc "Local Branches"]
 	set w_heads $w.list.l
 	slistbox $w_heads \
 		-height 10 \
@@ -128,7 +128,7 @@ method _delete {} {
 		set b [lindex $i 0]
 		set o [lindex $i 1]
 		if {[catch {git branch -D $b} err]} {
-			append failed " - $b: $err\n"
+			append failed [mc " - %s:" $b] " $err\n"
 		}
 	}
 

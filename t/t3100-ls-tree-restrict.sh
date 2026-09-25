@@ -16,6 +16,7 @@ This test runs git ls-tree with the following in a tree.
 The new path restriction code should do the right thing for path2 and
 path2/baz.  Also path0/ should snow nothing.
 '
+
 . ./test-lib.sh
 
 test_expect_success \
@@ -28,11 +29,11 @@ test_expect_success \
      echo Mi >path2/baz/b &&
      find path? \( -type f -o -type l \) -print |
      xargs git update-index --add &&
-     tree=`git write-tree` &&
+     tree=$(git write-tree) &&
      echo $tree'
 
 test_output () {
-    sed -e "s/ $_x40	/ X	/" <current >check
+    sed -e "s/ $OID_REGEX	/ X	/" <current >check
     test_cmp expected check
 }
 

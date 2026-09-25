@@ -2,7 +2,7 @@
 
 static HANDLE ms_eventlog;
 
-void openlog(const char *ident, int logopt, int facility)
+void openlog(const char *ident, int logopt UNUSED, int facility UNUSED)
 {
 	if (ms_eventlog)
 		return;
@@ -28,13 +28,13 @@ void syslog(int priority, const char *fmt, ...)
 	va_end(ap);
 
 	if (str_len < 0) {
-		warning("vsnprintf failed: '%s'", strerror(errno));
+		warning_errno("vsnprintf failed");
 		return;
 	}
 
-	str = malloc(str_len + 1);
+	str = malloc(st_add(str_len, 1));
 	if (!str) {
-		warning("malloc failed: '%s'", strerror(errno));
+		warning_errno("malloc failed");
 		return;
 	}
 
@@ -43,13 +43,18 @@ void syslog(int priority, const char *fmt, ...)
 	va_end(ap);
 
 	while ((pos = strstr(str, "%1")) != NULL) {
-		str = realloc(str, ++str_len + 1);
+		size_t offset = pos - str;
+		char *new_pos;
+		char *oldstr = str;
+		str = realloc(str, st_add(++str_len, 1));
 		if (!str) {
-			warning("realloc failed: '%s'", strerror(errno));
+			free(oldstr);
+			warning_errno("realloc failed");
 			return;
 		}
-		memmove(pos + 2, pos + 1, strlen(pos));
-		pos[1] = ' ';
+		new_pos = str + offset;
+		memmove(new_pos + 2, new_pos + 1, strlen(new_pos));
+		new_pos[1] = ' ';
 	}
 
 	switch (priority) {

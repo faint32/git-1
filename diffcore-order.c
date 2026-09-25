@@ -1,9 +1,12 @@
 /*
  * Copyright (C) 2005 Junio C Hamano
  */
-#include "cache.h"
+
+#include "git-compat-util.h"
+#include "gettext.h"
 #include "diff.h"
 #include "diffcore.h"
+#include "wildmatch.h"
 
 static char **order;
 static int order_cnt;
@@ -12,8 +15,7 @@ static void prepare_order(const char *orderfile)
 {
 	int cnt, pass;
 	struct strbuf sb = STRBUF_INIT;
-	void *map;
-	char *cp, *endp;
+	const char *cp, *endp;
 	ssize_t sz;
 
 	if (order)
@@ -22,14 +24,13 @@ static void prepare_order(const char *orderfile)
 	sz = strbuf_read_file(&sb, orderfile, 0);
 	if (sz < 0)
 		die_errno(_("failed to read orderfile '%s'"), orderfile);
-	map = strbuf_detach(&sb, NULL);
-	endp = (char *) map + sz;
+	endp = sb.buf + sz;
 
 	for (pass = 0; pass < 2; pass++) {
 		cnt = 0;
-		cp = map;
+		cp = sb.buf;
 		while (cp < endp) {
-			char *ep;
+			const char *ep;
 			for (ep = cp; ep < endp && *ep != '\n'; ep++)
 				;
 			/* cp to ep has one line */
@@ -38,12 +39,7 @@ static void prepare_order(const char *orderfile)
 			else if (pass == 0)
 				cnt++;
 			else {
-				if (*ep == '\n') {
-					*ep = 0;
-					order[cnt] = cp;
-				} else {
-					order[cnt] = xmemdupz(cp, ep - cp);
-				}
+				order[cnt] = xmemdupz(cp, ep - cp);
 				cnt++;
 			}
 			if (ep < endp)
@@ -52,9 +48,11 @@ static void prepare_order(const char *orderfile)
 		}
 		if (pass == 0) {
 			order_cnt = cnt;
-			order = xmalloc(sizeof(*order) * cnt);
+			ALLOC_ARRAY(order, cnt);
 		}
 	}
+
+	strbuf_release(&sb);
 }
 
 static int match_order(const char *path)
@@ -67,7 +65,7 @@ static int match_order(const char *path)
 		strbuf_addstr(&p, path);
 		while (p.buf[0]) {
 			char *cp;
-			if (!wildmatch(order[i], p.buf, 0, NULL))
+			if (!wildmatch(order[i], p.buf, 0))
 				return i;
 			cp = strrchr(p.buf, '/');
 			if (!cp)
@@ -101,7 +99,7 @@ void order_objects(const char *orderfile, obj_path_fn_t obj_path,
 		objs[i].orig_order = i;
 		objs[i].order = match_order(obj_path(objs[i].obj));
 	}
-	qsort(objs, nr, sizeof(*objs), compare_objs_order);
+	QSORT(objs, nr, compare_objs_order);
 }
 
 static const char *pair_pathtwo(void *obj)
@@ -120,7 +118,7 @@ void diffcore_order(const char *orderfile)
 	if (!q->nr)
 		return;
 
-	o = xmalloc(sizeof(*o) * q->nr);
+	ALLOC_ARRAY(o, q->nr);
 	for (i = 0; i < q->nr; i++)
 		o[i].obj = q->queue[i];
 	order_objects(orderfile, pair_pathtwo, o, q->nr);

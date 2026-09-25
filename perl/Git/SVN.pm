@@ -1,12 +1,12 @@
 package Git::SVN;
 use strict;
-use warnings;
+use warnings $ENV{GIT_PERL_FATAL_WARNINGS} ? qw(FATAL all) : ();
 use Fcntl qw/:DEFAULT :seek/;
-use constant rev_map_fmt => 'NH40';
+use constant rev_map_fmt => 'NH*';
 use vars qw/$_no_metadata
             $_repack $_repack_flags $_use_svm_props $_head
             $_use_svnsync_props $no_reuse_existing
-	    $_use_log_author $_add_author_from $_localtime/;
+	    $_use_log_author $_add_author_from $_localtime $_use_fsync/;
 use Carp qw/croak/;
 use File::Path qw/mkpath/;
 use IPC::Open3;
@@ -98,6 +98,11 @@ sub resolve_local_globs {
 				    " globbed: $refname\n";
 			}
 			my $u = (::cmt_metadata("$refname"))[0];
+			if (!defined($u)) {
+				warn
+"W: $refname: no associated commit metadata from SVN, skipping\n";
+				next;
+			}
 			$u =~ s!^\Q$url\E(/|$)!! or die
 			  "$refname: '$url' not found in '$u'\n";
 			if ($pathname ne $u) {
@@ -485,7 +490,7 @@ sub refname {
 	#
 	# Additionally, % must be escaped because it is used for escaping
 	# and we want our escaped refname to be reversible
-	$refname =~ s{([ \%~\^:\?\*\[\t])}{sprintf('%%%02X',ord($1))}eg;
+	$refname =~ s{([ \%~\^:\?\*\[\t\\])}{sprintf('%%%02X',ord($1))}eg;
 
 	# no slash-separated component can begin with a dot .
 	# /.* becomes /%2E*
@@ -758,7 +763,7 @@ sub prop_walk {
 		# this needs to be updated.
 		++$interesting_props if /^svn:(?:ignore|keywords|executable
 		                                 |eol-style|mime-type
-						 |externals|needs-lock)$/x;
+						 |externals|needs-lock|global-ignores)$/x;
 	}
 	&$sub($self, $p, $props) if $interesting_props;
 
@@ -802,10 +807,15 @@ sub get_fetch_range {
 	(++$min, $max);
 }
 
+sub svn_dir {
+	command_oneline(qw(rev-parse --git-path svn));
+}
+
 sub tmp_config {
 	my (@args) = @_;
-	my $old_def_config = "$ENV{GIT_DIR}/svn/config";
-	my $config = "$ENV{GIT_DIR}/svn/.metadata";
+	my $svn_dir = svn_dir();
+	my $old_def_config = "$svn_dir/config";
+	my $config = "$svn_dir/.metadata";
 	if (! -f $config && -f $old_def_config) {
 		rename $old_def_config, $config or
 		       die "Failed rename $old_def_config => $config: $!\n";
@@ -864,7 +874,7 @@ sub assert_index_clean {
 		command_noisy('read-tree', $treeish) unless -e $self->{index};
 		my $x = command_oneline('write-tree');
 		my ($y) = (command(qw/cat-file commit/, $treeish) =~
-		           /^tree ($::sha1)/mo);
+		           /^tree ($::oid)/mo);
 		return if $y eq $x;
 
 		warn "Index mismatch: $y != $x\nrereading $treeish\n";
@@ -1010,7 +1020,7 @@ sub do_git_commit {
 		$tree = $self->tmp_index_do(sub {
 		                            command_oneline('write-tree') });
 	}
-	die "Tree is not a valid sha1: $tree\n" if $tree !~ /^$::sha1$/o;
+	die "Tree is not a valid oid $tree\n" if $tree !~ /^$::oid$/o;
 
 	my @exec = ('git', 'commit-tree', $tree);
 	foreach ($self->get_commit_parents($log_entry)) {
@@ -1038,8 +1048,8 @@ sub do_git_commit {
 	close $out_fh or croak $!;
 	waitpid $pid, 0;
 	croak $? if $?;
-	if ($commit !~ /^$::sha1$/o) {
-		die "Failed to commit, invalid sha1: $commit\n";
+	if ($commit !~ /^$::oid$/o) {
+		die "Failed to commit, invalid oid: $commit\n";
 	}
 
 	$self->rev_map_set($log_entry->{revision}, $commit, 1);
@@ -1211,20 +1221,87 @@ sub do_fetch {
 sub mkemptydirs {
 	my ($self, $r) = @_;
 
+	# add/remove/collect a paths table
+	#
+	# Paths are split into a tree of nodes, stored as a hash of hashes.
+	#
+	# Each node contains a 'path' entry for the path (if any) associated
+	# with that node and a 'children' entry for any nodes under that
+	# location.
+	#
+	# Removing a path requires a hash lookup for each component then
+	# dropping that node (and anything under it), which is substantially
+	# faster than a grep slice into a single hash of paths for large
+	# numbers of paths.
+	#
+	# For a large (200K) number of empty_dir directives this reduces
+	# scanning time to 3 seconds vs 10 minutes for grep+delete on a single
+	# hash of paths.
+	sub add_path {
+		my ($paths_table, $path) = @_;
+		my $node_ref;
+
+		foreach my $x (split('/', $path)) {
+			if (!exists($paths_table->{$x})) {
+				$paths_table->{$x} = { children => {} };
+			}
+
+			$node_ref = $paths_table->{$x};
+			$paths_table = $paths_table->{$x}->{children};
+		}
+
+		$node_ref->{path} = $path;
+	}
+
+	sub remove_path {
+		my ($paths_table, $path) = @_;
+		my $nodes_ref;
+		my $node_name;
+
+		foreach my $x (split('/', $path)) {
+			if (!exists($paths_table->{$x})) {
+				return;
+			}
+
+			$nodes_ref = $paths_table;
+			$node_name = $x;
+
+			$paths_table = $paths_table->{$x}->{children};
+		}
+
+		delete($nodes_ref->{$node_name});
+	}
+
+	sub collect_paths {
+		my ($paths_table, $paths_ref) = @_;
+
+		foreach my $v (values %$paths_table) {
+			my $p = $v->{path};
+			my $c = $v->{children};
+
+			collect_paths($c, $paths_ref);
+
+			if (defined($p)) {
+				push(@$paths_ref, $p);
+			}
+		}
+	}
+
 	sub scan {
-		my ($r, $empty_dirs, $line) = @_;
+		my ($r, $paths_table, $line) = @_;
 		if (defined $r && $line =~ /^r(\d+)$/) {
 			return 0 if $1 > $r;
 		} elsif ($line =~ /^  \+empty_dir: (.+)$/) {
-			$empty_dirs->{$1} = 1;
+			add_path($paths_table, $1);
 		} elsif ($line =~ /^  \-empty_dir: (.+)$/) {
-			my @d = grep {m[^\Q$1\E(/|$)]} (keys %$empty_dirs);
-			delete @$empty_dirs{@d};
+			remove_path($paths_table, $1);
 		}
 		1; # continue
 	};
 
-	my %empty_dirs = ();
+	my @empty_dirs;
+	my %paths_table;
+
 	my $gz_file = "$self->{dir}/unhandled.log.gz";
 	if (-f $gz_file) {
 		if (!can_compress()) {
@@ -1235,7 +1312,7 @@ sub mkemptydirs {
 				die "Unable to open $gz_file: $!\n";
 			my $line;
 			while ($gz->gzreadline($line) > 0) {
-				scan($r, \%empty_dirs, $line) or last;
+				scan($r, \%paths_table, $line) or last;
 			}
 			$gz->gzclose;
 		}
@@ -1244,13 +1321,14 @@ sub mkemptydirs {
 	if (open my $fh, '<', "$self->{dir}/unhandled.log") {
 		binmode $fh or croak "binmode: $!";
 		while (<$fh>) {
-			scan($r, \%empty_dirs, $_) or last;
+			scan($r, \%paths_table, $_) or last;
 		}
 		close $fh;
 	}
 
+	collect_paths(\%paths_table, \@empty_dirs);
 	my $strip = qr/\A\Q@{[$self->path]}\E(?:\/|$)/;
-	foreach my $d (sort keys %empty_dirs) {
+	foreach my $d (sort @empty_dirs) {
 		$d = uri_decode($d);
 		$d =~ s/$strip//;
 		next unless length($d);
@@ -1327,7 +1405,7 @@ sub parse_svn_date {
 		$ENV{TZ} = 'UTC';
 
 		my $epoch_in_UTC =
-		    Time::Local::timelocal($S, $M, $H, $d, $m - 1, $Y - 1900);
+		    Time::Local::timelocal($S, $M, $H, $d, $m - 1, $Y);
 
 		# Determine our local timezone (including DST) at the
 		# time of $epoch_in_UTC.  $Git::SVN::Log::TZ stored the
@@ -1338,7 +1416,7 @@ sub parse_svn_date {
 			delete $ENV{TZ};
 		}
 
-		my $our_TZ = get_tz_offset();
+		my $our_TZ = get_tz_offset($epoch_in_UTC);
 
 		# This converts $epoch_in_UTC into our local timezone.
 		my ($sec, $min, $hour, $mday, $mon, $year,
@@ -1404,7 +1482,6 @@ sub call_authors_prog {
 	}
 	if ($author =~ /^\s*(.+?)\s*<(.*)>\s*$/) {
 		my ($name, $email) = ($1, $2);
-		$email = undef if length $2 == 0;
 		return [$name, $email];
 	} else {
 		die "Author: $orig_author: $::_authors_prog returned "
@@ -1414,6 +1491,10 @@ sub call_authors_prog {
 
 sub check_author {
 	my ($author) = @_;
+	if (defined $author) {
+		$author =~ s/^\s+//g;
+		$author =~ s/\s+$//g;
+	}
 	if (!defined $author || length $author == 0) {
 		$author = '(no author)';
 	}
@@ -1555,7 +1636,7 @@ sub has_no_changes {
 	my $commit = shift;
 
 	my @revs = split / /, command_oneline(
-		qw(rev-list --parents -1 -m), $commit);
+		qw(rev-list --parents -1), $commit);
 
 	# Commits with no parents, e.g. the start of a partial branch,
 	# have changes by definition.
@@ -1585,7 +1666,17 @@ sub tie_for_persistent_memoization {
 	if ($memo_backend > 0) {
 		tie %$hash => 'Git::SVN::Memoize::YAML', "$path.yaml";
 	} else {
-		tie %$hash => 'Memoize::Storable', "$path.db", 'nstore';
+		# first verify that any existing file can actually be loaded
+		# (it may have been saved by an incompatible version)
+		my $db = "$path.db";
+		if (-e $db) {
+			use Storable qw(retrieve);
+
+			if (!eval { retrieve($db); 1 }) {
+				unlink $db or die "unlink $db failed: $!";
+			}
+		}
+		tie %$hash => 'Memoize::Storable', $db, 'nstore';
 	}
 }
 
@@ -1598,7 +1689,7 @@ sub tie_for_persistent_memoization {
 		return if $memoized;
 		$memoized = 1;
 
-		my $cache_path = "$ENV{GIT_DIR}/svn/.caches/";
+		my $cache_path = svn_dir() . '/.caches/';
 		mkpath([$cache_path]) unless -d $cache_path;
 
 		my %lookup_svn_merge_cache;
@@ -1639,7 +1730,7 @@ sub tie_for_persistent_memoization {
 	sub clear_memoized_mergeinfo_caches {
 		die "Only call this method in non-memoized context" if ($memoized);
 
-		my $cache_path = "$ENV{GIT_DIR}/svn/.caches/";
+		my $cache_path = svn_dir() . '/.caches/';
 		return unless -d $cache_path;
 
 		for my $cache_file (("$cache_path/lookup_svn_merge",
@@ -1661,7 +1752,7 @@ sub tie_for_persistent_memoization {
 END {
 	# Force cache writeout explicitly instead of waiting for
 	# global destruction to avoid segfault in Storable:
-	# http://rt.cpan.org/Public/Bug/Display.html?id=36087
+	# https://rt.cpan.org/Public/Bug/Display.html?id=36087
 	unmemoize_svn_mergeinfo_functions();
 }
 
@@ -1836,15 +1927,22 @@ sub make_log_entry {
 
 	my @parents = @$parents;
 	my $props = $ed->{dir_prop}{$self->path};
-	if ( $props->{"svk:merge"} ) {
-		$self->find_extra_svk_parents($props->{"svk:merge"}, \@parents);
-	}
-	if ( $props->{"svn:mergeinfo"} ) {
-		my $mi_changes = $self->mergeinfo_changes
-			($parent_path, $parent_rev,
-			 $self->path, $rev,
-			 $props->{"svn:mergeinfo"});
-		$self->find_extra_svn_parents($mi_changes, \@parents);
+	if ($self->follow_parent) {
+		my $tickets = $props->{"svk:merge"};
+		if ($tickets) {
+			$self->find_extra_svk_parents($tickets, \@parents);
+		}
+
+		my $mergeinfo_prop = $props->{"svn:mergeinfo"};
+		if ($mergeinfo_prop) {
+			my $mi_changes = $self->mergeinfo_changes(
+						$parent_path,
+						$parent_rev,
+						$self->path,
+						$rev,
+						$mergeinfo_prop);
+			$self->find_extra_svn_parents($mi_changes, \@parents);
+		}
 	}
 
 	open my $un, '>>', "$self->{dir}/unhandled.log" or croak $!;
@@ -1925,8 +2023,8 @@ sub make_log_entry {
 		remove_username($full_url);
 		$log_entry{metadata} = "$full_url\@$r $uuid";
 		$log_entry{svm_revision} = $r;
-		$email ||= "$author\@$uuid";
-		$commit_email ||= "$author\@$uuid";
+		$email = "$author\@$uuid" unless defined $email;
+		$commit_email = "$author\@$uuid" unless defined $commit_email;
 	} elsif ($self->use_svnsync_props) {
 		my $full_url = canonicalize_url(
 			add_path_to_url( $self->svnsync->{url}, $self->path )
@@ -1934,15 +2032,15 @@ sub make_log_entry {
 		remove_username($full_url);
 		my $uuid = $self->svnsync->{uuid};
 		$log_entry{metadata} = "$full_url\@$rev $uuid";
-		$email ||= "$author\@$uuid";
-		$commit_email ||= "$author\@$uuid";
+		$email = "$author\@$uuid" unless defined $email;
+		$commit_email = "$author\@$uuid" unless defined $commit_email;
 	} else {
 		my $url = $self->metadata_url;
 		remove_username($url);
 		my $uuid = $self->rewrite_uuid || $self->ra->get_uuid;
 		$log_entry{metadata} = "$url\@$rev " . $uuid;
-		$email ||= "$author\@" . $uuid;
-		$commit_email ||= "$author\@" . $uuid;
+		$email = "$author\@$uuid" unless defined $email;
+		$commit_email = "$author\@$uuid" unless defined $commit_email;
 	}
 	$log_entry{name} = $name;
 	$log_entry{email} = $email;
@@ -1989,10 +2087,10 @@ sub rebuild_from_rev_db {
 	open my $fh, '<', $path or croak "open: $!";
 	binmode $fh or croak "binmode: $!";
 	while (<$fh>) {
-		length($_) == 41 or croak "inconsistent size in ($_) != 41";
+		length($_) == $::oid_length + 1 or croak "inconsistent size in ($_)";
 		chomp($_);
 		++$r;
-		next if $_ eq ('0' x 40);
+		next if $_ eq ('0' x $::oid_length);
 		$self->rev_map_set($r, $_);
 		print "r$r = $_\n";
 	}
@@ -2052,7 +2150,7 @@ sub rebuild {
 	my $svn_uuid = $self->rewrite_uuid || $self->ra_uuid;
 	my $c;
 	while (<$log>) {
-		if ( m{^commit ($::sha1)$} ) {
+		if ( m{^commit ($::oid)$} ) {
 			$c = $1;
 			next;
 		}
@@ -2098,9 +2196,9 @@ sub rebuild {
 # (mainly tags)
 #
 # The format is this:
-#   - 24 bytes for every record,
+#   - 24 or 36 bytes for every record,
 #     * 4 bytes for the integer representing an SVN revision number
-#     * 20 bytes representing the sha1 of a git commit
+#     * 20 or 32 bytes representing the oid of a git commit
 #   - No empty padding records like the old format
 #     (except the last record, which can be overwritten)
 #   - new records are written append-only since SVN revision numbers
@@ -2109,7 +2207,7 @@ sub rebuild {
 #   - Piping the file to xxd -c24 is a good way of dumping it for
 #     viewing or editing (piped back through xxd -r), should the need
 #     ever arise.
-#   - The last record can be padding revision with an all-zero sha1
+#   - The last record can be padding revision with an all-zero oid
 #     This is used to optimize fetch performance when using multiple
 #     "fetch" directives in .git/config
 #
@@ -2117,38 +2215,39 @@ sub rebuild {
 
 sub _rev_map_set {
 	my ($fh, $rev, $commit) = @_;
+	my $record_size = ($::oid_length / 2) + 4;
 
 	binmode $fh or croak "binmode: $!";
 	my $size = (stat($fh))[7];
-	($size % 24) == 0 or croak "inconsistent size: $size";
+	($size % $record_size) == 0 or croak "inconsistent size: $size";
 
 	my $wr_offset = 0;
 	if ($size > 0) {
-		sysseek($fh, -24, SEEK_END) or croak "seek: $!";
-		my $read = sysread($fh, my $buf, 24) or croak "read: $!";
-		$read == 24 or croak "read only $read bytes (!= 24)";
+		sysseek($fh, -$record_size, SEEK_END) or croak "seek: $!";
+		my $read = sysread($fh, my $buf, $record_size) or croak "read: $!";
+		$read == $record_size or croak "read only $read bytes (!= $record_size)";
 		my ($last_rev, $last_commit) = unpack(rev_map_fmt, $buf);
-		if ($last_commit eq ('0' x40)) {
-			if ($size >= 48) {
-				sysseek($fh, -48, SEEK_END) or croak "seek: $!";
-				$read = sysread($fh, $buf, 24) or
+		if ($last_commit eq ('0' x $::oid_length)) {
+			if ($size >= ($record_size * 2)) {
+				sysseek($fh, -($record_size * 2), SEEK_END) or croak "seek: $!";
+				$read = sysread($fh, $buf, $record_size) or
 				    croak "read: $!";
-				$read == 24 or
-				    croak "read only $read bytes (!= 24)";
+				$read == $record_size or
+				    croak "read only $read bytes (!= $record_size)";
 				($last_rev, $last_commit) =
 				    unpack(rev_map_fmt, $buf);
-				if ($last_commit eq ('0' x40)) {
+				if ($last_commit eq ('0' x $::oid_length)) {
 					croak "inconsistent .rev_map\n";
 				}
 			}
 			if ($last_rev >= $rev) {
 				croak "last_rev is higher!: $last_rev >= $rev";
 			}
-			$wr_offset = -24;
+			$wr_offset = -$record_size;
 		}
 	}
 	sysseek($fh, $wr_offset, SEEK_END) or croak "seek: $!";
-	syswrite($fh, pack(rev_map_fmt, $rev, $commit), 24) == 24 or
+	syswrite($fh, pack(rev_map_fmt, $rev, $commit), $record_size) == $record_size or
 	  croak "write: $!";
 }
 
@@ -2170,10 +2269,23 @@ sub mkfile {
 	}
 }
 
+# TODO: move this to Git.pm?
+sub use_fsync {
+	if (!defined($_use_fsync)) {
+		my $x = $ENV{GIT_TEST_FSYNC};
+		if (defined $x) {
+			my $v = command_oneline('-c', "test.fsync=$x",
+					qw(config --type=bool test.fsync));
+			$_use_fsync = defined($v) ? ($v eq "true\n") : 1;
+		}
+	}
+	$_use_fsync;
+}
+
 sub rev_map_set {
 	my ($self, $rev, $commit, $update_ref, $uuid) = @_;
 	defined $commit or die "missing arg3\n";
-	length $commit == 40 or die "arg3 must be a full SHA1 hexsum\n";
+	$commit =~ /^$::oid$/ or die "arg3 must be a full hex object ID\n";
 	my $db = $self->map_path($uuid);
 	my $db_lock = "$db.lock";
 	my $sigmask;
@@ -2191,7 +2303,7 @@ sub rev_map_set {
 	my $sync;
 	# both of these options make our .rev_db file very, very important
 	# and we can't afford to lose it because rebuild() won't work
-	if ($self->use_svm_props || $self->no_metadata) {
+	if (($self->use_svm_props || $self->no_metadata) && use_fsync()) {
 		require File::Copy;
 		$sync = 1;
 		File::Copy::copy($db, $db_lock) or die "rev_map_set(@_): ",
@@ -2246,29 +2358,30 @@ sub rev_map_max {
 
 sub rev_map_max_norebuild {
 	my ($self, $want_commit) = @_;
+	my $record_size = ($::oid_length / 2) + 4;
 	my $map_path = $self->map_path;
 	stat $map_path or return $want_commit ? (0, undef) : 0;
 	sysopen(my $fh, $map_path, O_RDONLY) or croak "open: $!";
 	binmode $fh or croak "binmode: $!";
 	my $size = (stat($fh))[7];
-	($size % 24) == 0 or croak "inconsistent size: $size";
+	($size % $record_size) == 0 or croak "inconsistent size: $size";
 
 	if ($size == 0) {
 		close $fh or croak "close: $!";
 		return $want_commit ? (0, undef) : 0;
 	}
 
-	sysseek($fh, -24, SEEK_END) or croak "seek: $!";
-	sysread($fh, my $buf, 24) == 24 or croak "read: $!";
+	sysseek($fh, -$record_size, SEEK_END) or croak "seek: $!";
+	sysread($fh, my $buf, $record_size) == $record_size or croak "read: $!";
 	my ($r, $c) = unpack(rev_map_fmt, $buf);
-	if ($want_commit && $c eq ('0' x40)) {
-		if ($size < 48) {
+	if ($want_commit && $c eq ('0' x $::oid_length)) {
+		if ($size < $record_size * 2) {
 			return $want_commit ? (0, undef) : 0;
 		}
-		sysseek($fh, -48, SEEK_END) or croak "seek: $!";
-		sysread($fh, $buf, 24) == 24 or croak "read: $!";
+		sysseek($fh, -($record_size * 2), SEEK_END) or croak "seek: $!";
+		sysread($fh, $buf, $record_size) == $record_size or croak "read: $!";
 		($r, $c) = unpack(rev_map_fmt, $buf);
-		if ($c eq ('0'x40)) {
+		if ($c eq ('0' x $::oid_length)) {
 			croak "Penultimate record is all-zeroes in $map_path";
 		}
 	}
@@ -2289,30 +2402,31 @@ sub rev_map_get {
 
 sub _rev_map_get {
 	my ($fh, $rev) = @_;
+	my $record_size = ($::oid_length / 2) + 4;
 
 	binmode $fh or croak "binmode: $!";
 	my $size = (stat($fh))[7];
-	($size % 24) == 0 or croak "inconsistent size: $size";
+	($size % $record_size) == 0 or croak "inconsistent size: $size";
 
 	if ($size == 0) {
 		return undef;
 	}
 
-	my ($l, $u) = (0, $size - 24);
+	my ($l, $u) = (0, $size - $record_size);
 	my ($r, $c, $buf);
 
 	while ($l <= $u) {
-		my $i = int(($l/24 + $u/24) / 2) * 24;
+		my $i = int(($l/$record_size + $u/$record_size) / 2) * $record_size;
 		sysseek($fh, $i, SEEK_SET) or croak "seek: $!";
-		sysread($fh, my $buf, 24) == 24 or croak "read: $!";
+		sysread($fh, my $buf, $record_size) == $record_size or croak "read: $!";
 		my ($r, $c) = unpack(rev_map_fmt, $buf);
 
 		if ($r < $rev) {
-			$l = $i + 24;
+			$l = $i + $record_size;
 		} elsif ($r > $rev) {
-			$u = $i - 24;
+			$u = $i - $record_size;
 		} else { # $r == $rev
-			return $c eq ('0' x 40) ? undef : $c;
+			return $c eq ('0' x $::oid_length) ? undef : $c;
 		}
 	}
 	undef;
@@ -2366,12 +2480,13 @@ sub _new {
 		             "refs/remotes/$prefix$default_ref_id";
 	}
 	$_[1] = $repo_id;
-	my $dir = "$ENV{GIT_DIR}/svn/$ref_id";
+	my $svn_dir = svn_dir();
+	my $dir = "$svn_dir/$ref_id";
 
-	# Older repos imported by us used $GIT_DIR/svn/foo instead of
-	# $GIT_DIR/svn/refs/remotes/foo when tracking refs/remotes/foo
+	# Older repos imported by us used $svn_dir/foo instead of
+	# $svn_dir/refs/remotes/foo when tracking refs/remotes/foo
 	if ($ref_id =~ m{^refs/remotes/(.+)}) {
-		my $old_dir = "$ENV{GIT_DIR}/svn/$1";
+		my $old_dir = "$svn_dir/$1";
 		if (-d $old_dir && ! -d $dir) {
 			$dir = $old_dir;
 		}
@@ -2381,7 +2496,7 @@ sub _new {
 	mkpath([$dir]);
 	my $obj = bless {
 		ref_id => $ref_id, dir => $dir, index => "$dir/index",
-	        config => "$ENV{GIT_DIR}/svn/config",
+	        config => "$svn_dir/config",
 	        map_root => "$dir/.rev_map", repo_id => $repo_id }, $class;
 
 	# Ensure it gets canonicalized

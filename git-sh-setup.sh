@@ -41,7 +41,10 @@ git_broken_path_fix () {
 	esac
 }
 
-# @@BROKEN_PATH_FIX@@
+# @BROKEN_PATH_FIX@
+
+# Source git-sh-i18n for gettext support.
+. "$(git --exec-path)/git-sh-i18n"
 
 die () {
 	die_with_status 1 "$@"
@@ -52,15 +55,6 @@ die_with_status () {
 	shift
 	printf >&2 '%s\n' "$*"
 	exit "$status"
-}
-
-GIT_QUIET=
-
-say () {
-	if test -z "$GIT_QUIET"
-	then
-		printf '%s\n' "$*"
-	fi
 }
 
 if test -n "$OPTIONS_SPEC"; then
@@ -83,16 +77,16 @@ if test -n "$OPTIONS_SPEC"; then
 else
 	dashless=$(basename -- "$0" | sed -e 's/-/ /')
 	usage() {
-		die "usage: $dashless $USAGE"
+		die "$(eval_gettext "usage: \$dashless \$USAGE")"
 	}
 
 	if [ -z "$LONG_USAGE" ]
 	then
-		LONG_USAGE="usage: $dashless $USAGE"
+		LONG_USAGE="$(eval_gettext "usage: \$dashless \$USAGE")"
 	else
-		LONG_USAGE="usage: $dashless $USAGE
+		LONG_USAGE="$(eval_gettext "usage: \$dashless \$USAGE
 
-$LONG_USAGE"
+$LONG_USAGE")"
 	fi
 
 	case "$1" in
@@ -160,19 +154,13 @@ git_pager() {
 	else
 		GIT_PAGER=cat
 	fi
-	: ${LESS=-FRX}
-	: ${LV=-c}
-	export LESS LV
+	for vardef in @PAGER_ENV@
+	do
+		var=${vardef%%=*}
+		eval ": \"\${$vardef}\" && export $var"
+	done
 
 	eval "$GIT_PAGER" '"$@"'
-}
-
-sane_grep () {
-	GREP_OPTIONS= LC_ALL=C grep "$@"
-}
-
-sane_egrep () {
-	GREP_OPTIONS= LC_ALL=C egrep "$@"
 }
 
 is_bare_repository () {
@@ -182,7 +170,7 @@ is_bare_repository () {
 cd_to_toplevel () {
 	cdup=$(git rev-parse --show-toplevel) &&
 	cd "$cdup" || {
-		echo >&2 "Cannot chdir to $cdup, the toplevel of the working tree"
+		gettextln "Cannot chdir to \$cdup, the toplevel of the working tree" >&2
 		exit 1
 	}
 }
@@ -190,13 +178,16 @@ cd_to_toplevel () {
 require_work_tree_exists () {
 	if test "z$(git rev-parse --is-bare-repository)" != zfalse
 	then
-		die "fatal: $0 cannot be used without a working tree."
+		program_name=$0
+		die "$(eval_gettext "fatal: \$program_name cannot be used without a working tree.")"
 	fi
 }
 
 require_work_tree () {
-	test "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true ||
-	die "fatal: $0 cannot be used without a working tree."
+	test "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true || {
+		program_name=$0
+		die "$(eval_gettext "fatal: \$program_name cannot be used without a working tree.")"
+	}
 }
 
 require_clean_work_tree () {
@@ -206,24 +197,33 @@ require_clean_work_tree () {
 
 	if ! git diff-files --quiet --ignore-submodules
 	then
-		echo >&2 "Cannot $1: You have unstaged changes."
+		action=$1
+		case "$action" in
+		"rewrite branches")
+			gettextln "Cannot rewrite branches: You have unstaged changes." >&2
+			;;
+		*)
+			eval_gettextln "Cannot \$action: You have unstaged changes." >&2
+			;;
+		esac
 		err=1
 	fi
 
 	if ! git diff-index --cached --quiet --ignore-submodules HEAD --
 	then
-		if [ $err = 0 ]
+		if test $err = 0
 		then
-		    echo >&2 "Cannot $1: Your index contains uncommitted changes."
+			action=$1
+			eval_gettextln "Cannot \$action: Your index contains uncommitted changes." >&2
 		else
-		    echo >&2 "Additionally, your index contains uncommitted changes."
+		    gettextln "Additionally, your index contains uncommitted changes." >&2
 		fi
 		err=1
 	fi
 
-	if [ $err = 1 ]
+	if test $err = 1
 	then
-		test -n "$2" && echo >&2 "$2"
+		test -n "$2" && echo "$2" >&2
 		exit 1
 	fi
 }
@@ -276,18 +276,11 @@ get_author_ident_from_commit () {
 	parse_ident_from_commit author AUTHOR
 }
 
-# Clear repo-local GIT_* environment variables. Useful when switching to
-# another repository (e.g. when entering a submodule). See also the env
-# list in git_connect()
-clear_local_git_env() {
-	unset $(git rev-parse --local-env-vars)
-}
-
 # Generate a virtual base file for a two-file merge. Uses git apply to
 # remove lines from $1 that are not in $2, leaving only common lines.
 create_virtual_base() {
 	sz0=$(wc -c <"$1")
-	@@DIFF@@ -u -La/"$1" -Lb/"$1" "$1" "$2" | git apply --no-add
+	@DIFF@ -u -La/"$1" -Lb/"$1" "$1" "$2" | git apply --no-add
 	sz1=$(wc -c <"$1")
 
 	# If we do not have enough common material, it is not
@@ -336,15 +329,15 @@ git_dir_init () {
 	then
 		test -z "$(git rev-parse --show-cdup)" || {
 			exit=$?
-			echo >&2 "You need to run this command from the toplevel of the working tree."
+			gettextln "You need to run this command from the toplevel of the working tree." >&2
 			exit $exit
 		}
 	fi
 	test -n "$GIT_DIR" && GIT_DIR=$(cd "$GIT_DIR" && pwd) || {
-		echo >&2 "Unable to determine absolute path of git directory"
+		gettextln "Unable to determine absolute path of git directory" >&2
 		exit 1
 	}
-	: ${GIT_OBJECT_DIRECTORY="$(git rev-parse --git-path objects)"}
+	: "${GIT_OBJECT_DIRECTORY="$(git rev-parse --git-path objects)"}"
 }
 
 if test -z "$NONGIT_OK"

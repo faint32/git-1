@@ -69,6 +69,7 @@ proc tools_populate_one {fullname} {
 proc tools_exec {fullname} {
 	global repo_config env current_diff_path
 	global current_branch is_detached
+	global selected_paths
 
 	if {[is_config_true "guitool.$fullname.needsfile"]} {
 		if {$current_diff_path eq {}} {
@@ -100,6 +101,7 @@ proc tools_exec {fullname} {
 
 	set env(GIT_GUITOOL) $fullname
 	set env(FILENAME) $current_diff_path
+	set env(FILENAMES) [join [array names selected_paths] \n]
 	if {$is_detached} {
 		set env(CUR_BRANCH) ""
 	} else {
@@ -108,27 +110,27 @@ proc tools_exec {fullname} {
 
 	set cmdline $repo_config(guitool.$fullname.cmd)
 	if {[is_config_true "guitool.$fullname.noconsole"]} {
-		tools_run_silent [list sh -c $cmdline] \
+		tools_run_silent [list [shellpath] -c $cmdline] \
 				 [list tools_complete $fullname {}]
 	} else {
 		regsub {/} $fullname { / } title
 		set w [console::new \
 			[mc "Tool: %s" $title] \
 			[mc "Running: %s" $cmdline]]
-		console::exec $w [list sh -c $cmdline] \
+		console::exec $w [list [shellpath] -c $cmdline] \
 				 [list tools_complete $fullname $w]
 	}
 
 	unset env(GIT_GUITOOL)
 	unset env(FILENAME)
+	unset env(FILENAMES)
 	unset env(CUR_BRANCH)
 	catch { unset env(ARGS) }
 	catch { unset env(REVISION) }
 }
 
 proc tools_run_silent {cmd after} {
-	lappend cmd 2>@1
-	set fd [_open_stdout_stderr $cmd]
+	set fd [safe_open_command $cmd [list 2>@1]]
 
 	fconfigure $fd -blocking 0 -translation binary
 	fileevent $fd readable [list tools_consume_input $fd $after]

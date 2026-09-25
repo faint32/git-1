@@ -1,7 +1,14 @@
 #!/bin/sh
 
 test_description='fetching via git:// using core.gitproxy'
+
 . ./test-lib.sh
+
+if ! test_have_prereq PERL_TEST_HELPERS
+then
+	skip_all='skipping fetch proxy tests; Perl not available'
+	test_done
+fi
 
 test_expect_success 'setup remote repo' '
 	git init remote &&
@@ -12,10 +19,8 @@ test_expect_success 'setup remote repo' '
 	)
 '
 
-cat >proxy <<'EOF'
-#!/bin/sh
-echo >&2 "proxying for $*"
-cmd=`"$PERL_PATH" -e '
+test_expect_success 'setup proxy script' '
+	write_script proxy-get-cmd "$PERL_PATH" <<-\EOF &&
 	read(STDIN, $buf, 4);
 	my $n = hex($buf) - 4;
 	read(STDIN, $buf, $n);
@@ -23,11 +28,16 @@ cmd=`"$PERL_PATH" -e '
 	# drop absolute-path on repo name
 	$cmd =~ s{ /}{ };
 	print $cmd;
-'`
-echo >&2 "Running '$cmd'"
-exec $cmd
-EOF
-chmod +x proxy
+	EOF
+
+	write_script proxy <<-\EOF
+	echo >&2 "proxying for $*"
+	cmd=$(./proxy-get-cmd)
+	echo >&2 "Running $cmd"
+	exec $cmd
+	EOF
+'
+
 test_expect_success 'setup local repo' '
 	git remote add fake git://example.com/remote &&
 	git config core.gitproxy ./proxy
@@ -38,6 +48,11 @@ test_expect_success 'fetch through proxy works' '
 	echo one >expect &&
 	git log -1 --format=%s FETCH_HEAD >actual &&
 	test_cmp expect actual
+'
+
+test_expect_success 'funny hostnames are rejected before running proxy' '
+	test_must_fail git fetch git://-remote/repo.git 2>stderr &&
+	test_grep ! "proxying for" stderr
 '
 
 test_done

@@ -2,6 +2,7 @@
 #
 # Copyright (c) 2006 Eric Wong
 test_description='git svn commit-diff clobber'
+
 . ./lib-git-svn.sh
 
 test_expect_success 'initialize repo' '
@@ -44,7 +45,7 @@ test_expect_success 'commit complementing change from git' '
 test_expect_success 'dcommit fails to commit because of conflict' '
 	git svn init "$svnrepo" &&
 	git svn fetch &&
-	git reset --hard refs/${remotes_git_svn} &&
+	git reset --hard refs/remotes/git-svn &&
 	svn_cmd co "$svnrepo" t.svn &&
 	(
 		cd t.svn &&
@@ -59,7 +60,7 @@ test_expect_success 'dcommit fails to commit because of conflict' '
 	'
 
 test_expect_success 'dcommit does the svn equivalent of an index merge' "
-	git reset --hard refs/${remotes_git_svn} &&
+	git reset --hard refs/remotes/git-svn &&
 	echo 'index merge' > file2 &&
 	git update-index --add file2 &&
 	git commit -a -m 'index merge' &&
@@ -81,7 +82,7 @@ test_expect_success 'commit another change from svn side' '
 	'
 
 test_expect_success 'multiple dcommit from git svn will not clobber svn' "
-	git reset --hard refs/${remotes_git_svn} &&
+	git reset --hard refs/remotes/git-svn &&
 	echo new file >> new-file &&
 	git update-index --add new-file &&
 	git commit -a -m 'new file' &&
@@ -92,7 +93,8 @@ test_expect_success 'multiple dcommit from git svn will not clobber svn' "
 
 
 test_expect_success 'check that rebase really failed' '
-	test -d .git/rebase-apply
+	git status >output &&
+	test_grep currently.rebasing output
 '
 
 test_expect_success 'resolve, continue the rebase and dcommit' "

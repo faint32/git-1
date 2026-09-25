@@ -1,29 +1,134 @@
-#include "cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
+
+#include "git-compat-util.h"
+#include "alias.h"
+#include "config.h"
+#include "gettext.h"
+#include "strbuf.h"
+#include "string-list.h"
+
+struct config_alias_data {
+	const char *alias;
+	char *v;
+	struct string_list *list;
+};
+
+static int config_alias_cb(const char *var, const char *value,
+			   const struct config_context *ctx UNUSED, void *d)
+{
+	struct config_alias_data *data = d;
+	const char *subsection, *key;
+	size_t subsection_len;
+
+	if (parse_config_key(var, "alias", &subsection, &subsection_len,
+			     &key) < 0)
+		return 0;
+
+	/*
+	 * Two config syntaxes:
+	 * - alias.name = value   (without subsection, case-insensitive)
+	 * - [alias "name"]
+	 *       command = value  (with subsection, case-sensitive)
+	 */
+	/* Treat [alias ""] (empty subsection) the same as plain [alias]. */
+	if (subsection && !subsection_len)
+		subsection = NULL;
+
+	if (subsection && strcmp(key, "command")) {
+		/*
+		 * We have historically supported the "alias.name" form when
+		 * "name" happens to contain dots (e.g., alias.foo.bar to allow
+		 * "git foo.bar". But our parsing above would split that into
+		 * subsection "foo".
+		 *
+		 * If we do not understand the final key in a subsection-style
+		 * variable, fall back to treating it as a two-level alias.
+		 */
+		key = var + strlen("alias.");
+		subsection = NULL;
+		subsection_len = 0;
+	}
+
+	if (data->alias) {
+		int match;
+
+		if (subsection)
+			match = (strlen(data->alias) == subsection_len &&
+				 !strncmp(data->alias, subsection,
+					  subsection_len));
+		else
+			match = !strcasecmp(data->alias, key);
+
+		if (match) {
+			FREE_AND_NULL(data->v);
+			return git_config_string(&data->v,
+						 var, value);
+		}
+	} else if (data->list) {
+		struct string_list_item *item;
+
+		if (!value)
+			return config_error_nonbool(var);
+
+		if (subsection)
+			item = string_list_append_nodup(data->list,
+				xmemdupz(subsection, subsection_len));
+		else
+			item = string_list_append(data->list, key);
+		item->util = xstrdup(value);
+	}
+
+	return 0;
+}
 
 char *alias_lookup(const char *alias)
 {
-	char *v = NULL;
-	struct strbuf key = STRBUF_INIT;
-	strbuf_addf(&key, "alias.%s", alias);
-	if (git_config_key_is_valid(key.buf))
-		git_config_get_string(key.buf, &v);
-	strbuf_release(&key);
-	return v;
+	struct config_alias_data data = { alias, NULL };
+
+	read_early_config(the_repository, config_alias_cb, &data);
+
+	return data.v;
+}
+
+void list_aliases(struct string_list *list)
+{
+	struct config_alias_data data = { NULL, NULL, list };
+
+	read_early_config(the_repository, config_alias_cb, &data);
+}
+
+void quote_cmdline(struct strbuf *buf, const char **argv)
+{
+	for (const char **argp = argv; *argp; argp++) {
+		if (argp != argv)
+			strbuf_addch(buf, ' ');
+		strbuf_addch(buf, '"');
+		for (const char *p = *argp; *p; p++) {
+			const char c = *p;
+
+			if (c == '"' || c =='\\')
+				strbuf_addch(buf, '\\');
+			strbuf_addch(buf, c);
+		}
+		strbuf_addch(buf, '"');
+	}
 }
 
 #define SPLIT_CMDLINE_BAD_ENDING 1
 #define SPLIT_CMDLINE_UNCLOSED_QUOTE 2
+#define SPLIT_CMDLINE_ARGC_OVERFLOW 3
 static const char *split_cmdline_errors[] = {
-	"cmdline ends with \\",
-	"unclosed quote"
+	N_("cmdline ends with \\"),
+	N_("unclosed quote"),
+	N_("too many arguments"),
 };
 
 int split_cmdline(char *cmdline, const char ***argv)
 {
-	int src, dst, count = 0, size = 16;
+	size_t src, dst, count = 0, size = 16;
 	char quoted = 0;
 
-	*argv = xmalloc(sizeof(**argv) * size);
+	ALLOC_ARRAY(*argv, size);
 
 	/* split alias_string */
 	(*argv)[count++] = cmdline;
@@ -47,8 +152,7 @@ int split_cmdline(char *cmdline, const char ***argv)
 				src++;
 				c = cmdline[src];
 				if (!c) {
-					free(*argv);
-					*argv = NULL;
+					FREE_AND_NULL(*argv);
 					return -SPLIT_CMDLINE_BAD_ENDING;
 				}
 			}
@@ -60,9 +164,13 @@ int split_cmdline(char *cmdline, const char ***argv)
 	cmdline[dst] = 0;
 
 	if (quoted) {
-		free(*argv);
-		*argv = NULL;
+		FREE_AND_NULL(*argv);
 		return -SPLIT_CMDLINE_UNCLOSED_QUOTE;
+	}
+
+	if (count >= INT_MAX) {
+		FREE_AND_NULL(*argv);
+		return -SPLIT_CMDLINE_ARGC_OVERFLOW;
 	}
 
 	ALLOC_GROW(*argv, count + 1, size);

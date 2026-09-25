@@ -34,7 +34,7 @@ doit () {
 
 	commit=$(echo $NAME | git commit-tree $T $PARENTS) &&
 
-	echo $commit >.git/refs/tags/$NAME &&
+	git update-ref "refs/tags/$NAME" "$commit" &&
 	echo $commit
 }
 
@@ -215,11 +215,13 @@ test_expect_success 'criss-cross merge-base for octopus-step' '
 	git reset --hard E &&
 	test_commit CC2 &&
 	test_tick &&
-	git merge -s ours CC1 &&
+	# E is a root commit unrelated to MMR root on which CC1 is based
+	git merge -s ours --allow-unrelated-histories CC1 &&
 	test_commit CC-o &&
 	test_commit CCB &&
 	git reset --hard CC1 &&
-	git merge -s ours CC2 &&
+	# E is a root commit unrelated to MMR root on which CC1 is based
+	git merge -s ours --allow-unrelated-histories CC2 &&
 	test_commit CCA &&
 
 	git rev-parse CC1 CC2 >expected &&
@@ -243,7 +245,7 @@ test_expect_success 'using reflog to find the fork point' '
 			git commit --allow-empty -m "Derived #$count" &&
 			git rev-parse HEAD >derived$count &&
 			git checkout -B base $E || exit 1
-		done
+		done &&
 
 		for count in 1 2 3
 		do
@@ -255,6 +257,12 @@ test_expect_success 'using reflog to find the fork point' '
 	# check that we correctly default to HEAD
 	git checkout derived &&
 	git merge-base --fork-point base >actual &&
+	test_cmp expect3 actual
+'
+
+test_expect_success '--fork-point works with empty reflog' '
+	git -c core.logallrefupdates=false branch no-reflog base &&
+	git merge-base --fork-point no-reflog derived &&
 	test_cmp expect3 actual
 '
 
@@ -295,6 +303,37 @@ test_expect_success 'merge-base --octopus --all for complex tree' '
 	git rev-parse JC >expected &&
 	git merge-base --all --octopus JAA JDD JE >actual &&
 	test_cmp expected actual
+'
+
+test_expect_success '--is-ancestor with an ancestor and a descendant' '
+	git merge-base --is-ancestor $E $A &&
+	test_expect_code 1 git merge-base --is-ancestor $A $E
+'
+
+test_expect_success '--is-ancestor treats a commit as its own ancestor' '
+	git merge-base --is-ancestor $A $A
+'
+
+test_expect_success '--is-ancestor with diverged commits' '
+	test_expect_code 1 git merge-base --is-ancestor $G $H &&
+	test_expect_code 1 git merge-base --is-ancestor $H $G
+'
+
+test_expect_success '--is-ancestor exits 128 on a bad commit' '
+	test_expect_code 128 git merge-base --is-ancestor $A no-such-commit &&
+	test_expect_code 128 git merge-base --is-ancestor no-such-commit $A
+'
+
+test_expect_success '--is-ancestor requires exactly two commits' '
+	test_expect_code 129 git merge-base --is-ancestor &&
+	test_expect_code 129 git merge-base --is-ancestor $A &&
+	test_expect_code 128 git merge-base --is-ancestor $E $A $B 2>err &&
+	test_grep ".--is-ancestor takes exactly two commits" err
+'
+
+test_expect_success '--is-ancestor and --all cannot be used together' '
+	test_expect_code 128 git merge-base --is-ancestor --all $E $A 2>err &&
+	test_grep "options .--is-ancestor. and .--all. cannot be used together" err
 '
 
 test_done

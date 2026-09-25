@@ -1,68 +1,91 @@
+#define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
 #include "builtin.h"
+#include "gettext.h"
+#include "hex.h"
+#include "object-file.h"
 #include "pkt-line.h"
 #include "fetch-pack.h"
 #include "remote.h"
 #include "connect.h"
-#include "sha1-array.h"
+#include "oid-array.h"
+#include "protocol.h"
 
 static const char fetch_pack_usage[] =
 "git fetch-pack [--all] [--stdin] [--quiet | -q] [--keep | -k] [--thin] "
 "[--include-tag] [--upload-pack=<git-upload-pack>] [--depth=<n>] "
 "[--no-progress] [--diag-url] [-v] [<host>:]<directory> [<refs>...]";
 
-static void add_sought_entry_mem(struct ref ***sought, int *nr, int *alloc,
-				 const char *name, int namelen)
+static void add_sought_entry(struct ref ***sought, int *nr, int *alloc,
+			     const char *name)
 {
-	struct ref *ref = xcalloc(1, sizeof(*ref) + namelen + 1);
-	unsigned char sha1[20];
+	struct ref *ref;
+	struct object_id oid;
+	const char *p;
 
-	if (namelen > 41 && name[40] == ' ' && !get_sha1_hex(name, sha1)) {
-		hashcpy(ref->old_sha1, sha1);
-		name += 41;
-		namelen -= 41;
+	if (!parse_oid_hex(name, &oid, &p)) {
+		if (*p == ' ') {
+			/* <oid> <ref>, find refname */
+			name = p + 1;
+		} else if (*p == '\0') {
+			; /* <oid>, leave oid as name */
+		} else {
+			/* <ref>, clear cruft from oid */
+			oidclr(&oid, the_repository->hash_algo);
+		}
+	} else {
+		/* <ref>, clear cruft from get_oid_hex */
+		oidclr(&oid, the_repository->hash_algo);
 	}
 
-	memcpy(ref->name, name, namelen);
-	ref->name[namelen] = '\0';
+	ref = alloc_ref(name);
+	oidcpy(&ref->old_oid, &oid);
 	(*nr)++;
 	ALLOC_GROW(*sought, *nr, *alloc);
 	(*sought)[*nr - 1] = ref;
 }
 
-static void add_sought_entry(struct ref ***sought, int *nr, int *alloc,
-			     const char *string)
-{
-	add_sought_entry_mem(sought, nr, alloc, string, strlen(string));
-}
-
-int cmd_fetch_pack(int argc, const char **argv, const char *prefix)
+int cmd_fetch_pack(int argc,
+		   const char **argv,
+		   const char *prefix UNUSED,
+		   struct repository *repo)
 {
 	int i, ret;
-	struct ref *ref = NULL;
+	struct ref *fetched_refs = NULL, *remote_refs = NULL;
 	const char *dest = NULL;
 	struct ref **sought = NULL;
+	struct ref **sought_to_free = NULL;
 	int nr_sought = 0, alloc_sought = 0;
 	int fd[2];
-	char *pack_lockfile = NULL;
-	char **pack_lockfile_ptr = NULL;
+	struct string_list pack_lockfiles = STRING_LIST_INIT_DUP;
+	struct string_list *pack_lockfiles_ptr = NULL;
 	struct child_process *conn;
 	struct fetch_pack_args args;
-	struct sha1_array shallow = SHA1_ARRAY_INIT;
+	struct oid_array shallow = OID_ARRAY_INIT;
+	struct string_list deepen_not = STRING_LIST_INIT_DUP;
+	struct packet_reader reader;
+	enum protocol_version version;
 
 	packet_trace_identity("fetch-pack");
 
 	memset(&args, 0, sizeof(args));
+	list_objects_filter_init(&args.filter_options);
 	args.uploadpack = "git-upload-pack";
+
+	show_usage_if_asked(argc, argv, fetch_pack_usage);
+
+	repo->fetch_if_missing = 0;
 
 	for (i = 1; i < argc && *argv[i] == '-'; i++) {
 		const char *arg = argv[i];
 
-		if (starts_with(arg, "--upload-pack=")) {
-			args.uploadpack = arg + 14;
+		if (skip_prefix(arg, "--upload-pack=", &arg)) {
+			args.uploadpack = arg;
 			continue;
 		}
-		if (starts_with(arg, "--exec=")) {
-			args.uploadpack = arg + 7;
+		if (skip_prefix(arg, "--exec=", &arg)) {
+			args.uploadpack = arg;
 			continue;
 		}
 		if (!strcmp("--quiet", arg) || !strcmp("-q", arg)) {
@@ -98,8 +121,20 @@ int cmd_fetch_pack(int argc, const char **argv, const char *prefix)
 			args.verbose = 1;
 			continue;
 		}
-		if (starts_with(arg, "--depth=")) {
-			args.depth = strtol(arg + 8, NULL, 0);
+		if (skip_prefix(arg, "--depth=", &arg)) {
+			args.depth = strtol(arg, NULL, 0);
+			continue;
+		}
+		if (skip_prefix(arg, "--shallow-since=", &arg)) {
+			args.deepen_since = xstrdup(arg);
+			continue;
+		}
+		if (skip_prefix(arg, "--shallow-exclude=", &arg)) {
+			string_list_append(&deepen_not, arg);
+			continue;
+		}
+		if (!strcmp(arg, "--deepen-relative")) {
+			args.deepen_relative = 1;
 			continue;
 		}
 		if (!strcmp("--no-progress", arg)) {
@@ -112,7 +147,7 @@ int cmd_fetch_pack(int argc, const char **argv, const char *prefix)
 		}
 		if (!strcmp("--lock-pack", arg)) {
 			args.lock_pack = 1;
-			pack_lockfile_ptr = &pack_lockfile;
+			pack_lockfiles_ptr = &pack_lockfiles;
 			continue;
 		}
 		if (!strcmp("--check-self-contained-and-connected", arg)) {
@@ -127,8 +162,26 @@ int cmd_fetch_pack(int argc, const char **argv, const char *prefix)
 			args.update_shallow = 1;
 			continue;
 		}
+		if (!strcmp("--from-promisor", arg)) {
+			args.from_promisor = 1;
+			continue;
+		}
+		if (!strcmp("--refetch", arg)) {
+			args.refetch = 1;
+			continue;
+		}
+		if (skip_prefix(arg, ("--filter="), &arg)) {
+			parse_list_objects_filter(&args.filter_options, arg);
+			continue;
+		}
+		if (!strcmp(arg, ("--no-filter"))) {
+			list_objects_filter_set_no_filter(&args.filter_options);
+			continue;
+		}
 		usage(fetch_pack_usage);
 	}
+	if (deepen_not.nr)
+		args.deepen_not = &deepen_not;
 
 	if (i < argc)
 		dest = argv[i++];
@@ -156,7 +209,7 @@ int cmd_fetch_pack(int argc, const char **argv, const char *prefix)
 		else {
 			/* read from stdin one ref per line, until EOF */
 			struct strbuf line = STRBUF_INIT;
-			while (strbuf_getline(&line, stdin, '\n') != EOF)
+			while (strbuf_getline_lf(&line, stdin) != EOF)
 				add_sought_entry(&sought, &nr_sought, &alloc_sought, line.buf);
 			strbuf_release(&line);
 		}
@@ -170,18 +223,49 @@ int cmd_fetch_pack(int argc, const char **argv, const char *prefix)
 		int flags = args.verbose ? CONNECT_VERBOSE : 0;
 		if (args.diag_url)
 			flags |= CONNECT_DIAG_URL;
-		conn = git_connect(fd, dest, args.uploadpack,
-				   flags);
+		conn = git_connect(fd, dest, GIT_CONNECT_UPLOAD_PACK,
+				   args.uploadpack, flags);
 		if (!conn)
 			return args.diag_url ? 0 : 1;
 	}
-	get_remote_heads(fd[0], NULL, 0, &ref, 0, NULL, &shallow);
 
-	ref = fetch_pack(&args, fd, conn, ref, dest, sought, nr_sought,
-			 &shallow, pack_lockfile_ptr);
-	if (pack_lockfile) {
-		printf("lock %s\n", pack_lockfile);
+	packet_reader_init(&reader, fd[0], NULL, 0,
+			   PACKET_READ_CHOMP_NEWLINE |
+			   PACKET_READ_GENTLE_ON_EOF |
+			   PACKET_READ_DIE_ON_ERR_PACKET);
+
+	version = discover_version(&reader);
+	switch (version) {
+	case protocol_v2:
+		get_remote_refs(fd[1], &reader, &remote_refs, 0, NULL, NULL,
+				args.stateless_rpc);
+		break;
+	case protocol_v1:
+	case protocol_v0:
+		get_remote_heads(&reader, &remote_refs, 0, NULL, &shallow);
+		break;
+	case protocol_unknown_version:
+		BUG("unknown protocol version");
+	}
+
+	/*
+	 * Create a shallow copy of `sought` so that we can free all of its entries.
+	 * This is because `fetch_pack()` will modify the array to evict some
+	 * entries, but won't free those.
+	 */
+	DUP_ARRAY(sought_to_free, sought, nr_sought);
+
+	fetched_refs = fetch_pack(&args, fd, remote_refs, sought, nr_sought,
+			 &shallow, pack_lockfiles_ptr, version);
+
+	if (pack_lockfiles.nr) {
+		int i;
+
+		printf("lock %s\n", pack_lockfiles.items[0].string);
 		fflush(stdout);
+		for (i = 1; i < pack_lockfiles.nr; i++)
+			warning(_("Lockfile created but not reported: %s"),
+				pack_lockfiles.items[i].string);
 	}
 	if (args.check_self_contained_and_connected &&
 	    args.self_contained_and_connected) {
@@ -190,10 +274,12 @@ int cmd_fetch_pack(int argc, const char **argv, const char *prefix)
 	}
 	close(fd[0]);
 	close(fd[1]);
-	if (finish_connect(conn))
-		return 1;
+	if (finish_connect(conn)) {
+		ret = 1;
+		goto cleanup;
+	}
 
-	ret = !ref;
+	ret = !fetched_refs;
 
 	/*
 	 * If the heads to pull were given, we should have consumed
@@ -201,18 +287,21 @@ int cmd_fetch_pack(int argc, const char **argv, const char *prefix)
 	 * remote no-such-ref' would silently succeed without issuing
 	 * an error.
 	 */
-	for (i = 0; i < nr_sought; i++) {
-		if (!sought[i] || sought[i]->matched)
-			continue;
-		error("no such remote ref %s", sought[i]->name);
-		ret = 1;
-	}
+	ret |= report_unmatched_refs(sought, nr_sought);
 
-	while (ref) {
+	for (struct ref *ref = fetched_refs; ref; ref = ref->next)
 		printf("%s %s\n",
-		       sha1_to_hex(ref->old_sha1), ref->name);
-		ref = ref->next;
-	}
+		       oid_to_hex(&ref->old_oid), ref->name);
 
+cleanup:
+	for (size_t i = 0; i < nr_sought; i++)
+		free_one_ref(sought_to_free[i]);
+	free(sought_to_free);
+	free(sought);
+	free_refs(fetched_refs);
+	free_refs(remote_refs);
+	list_objects_filter_release(&args.filter_options);
+	oid_array_clear(&shallow);
+	string_list_clear(&pack_lockfiles, 0);
 	return ret;
 }

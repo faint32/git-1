@@ -14,7 +14,11 @@ typedef _mode_t	mode_t;
 
 #ifndef _SSIZE_T_
 #define _SSIZE_T_
+#ifdef _WIN64
+typedef __int64 _ssize_t;
+#else
 typedef long _ssize_t;
+#endif /* _WIN64 */
 
 #ifndef	_OFF_T_
 #define	_OFF_T_
@@ -45,11 +49,15 @@ typedef unsigned long long uintmax_t;
 
 typedef int64_t off64_t;
 
+#if !defined(_MSC_VER) || _MSC_VER < 1600
 #define INTMAX_MIN  _I64_MIN
 #define INTMAX_MAX  _I64_MAX
 #define UINTMAX_MAX _UI64_MAX
 
 #define UINT32_MAX 0xffffffff  /* 4294967295U */
+#else
+#include <stdint.h>
+#endif
 
 #define STDIN_FILENO  0
 #define STDOUT_FILENO 1
